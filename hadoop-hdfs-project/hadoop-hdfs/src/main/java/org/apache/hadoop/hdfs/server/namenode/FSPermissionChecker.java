@@ -24,8 +24,8 @@ import java.util.List;
 import java.util.Stack;
 
 import com.google.common.base.Preconditions;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.fs.FSExceptionMessages;
 import org.apache.hadoop.fs.ParentNotDirectoryException;
 import org.apache.hadoop.fs.permission.AclEntryScope;
@@ -44,10 +44,10 @@ import org.apache.hadoop.security.UserGroupInformation;
  * The state of this class need not be synchronized as it has data structures that
  * are read-only.
  * 
- * Some of the helper methods are gaurded by {@link FSNamesystem#readLock()}.
+ * Some of the helper methods are guarded by {@link FSNamesystem#readLock()}.
  */
-class FSPermissionChecker implements AccessControlEnforcer {
-  static final Log LOG = LogFactory.getLog(UserGroupInformation.class);
+public class FSPermissionChecker implements AccessControlEnforcer {
+  static final Logger LOG = LoggerFactory.getLogger(UserGroupInformation.class);
 
   private static String getPath(byte[][] components, int start, int end) {
     return DFSUtil.byteArray2PathString(components, start, end - start + 1);
@@ -86,7 +86,7 @@ class FSPermissionChecker implements AccessControlEnforcer {
   private final INodeAttributeProvider attributeProvider;
 
 
-  FSPermissionChecker(String fsOwner, String supergroup,
+  protected FSPermissionChecker(String fsOwner, String supergroup,
       UserGroupInformation callerUgi,
       INodeAttributeProvider attributeProvider) {
     this.fsOwner = fsOwner;
@@ -275,8 +275,16 @@ class FSPermissionChecker implements AccessControlEnforcer {
     INodeAttributes inodeAttrs = inode.getSnapshotINode(snapshotId);
     if (getAttributesProvider() != null) {
       String[] elements = new String[pathIdx + 1];
-      for (int i = 0; i < elements.length; i++) {
-        elements[i] = DFSUtil.bytes2String(pathByNameArr[i]);
+      /**
+       * {@link INode#getPathComponents(String)} returns a null component
+       * for the root only path "/". Assign an empty string if so.
+       */
+      if (pathByNameArr.length == 1 && pathByNameArr[0] == null) {
+        elements[0] = "";
+      } else {
+        for (int i = 0; i < elements.length; i++) {
+          elements[i] = DFSUtil.bytes2String(pathByNameArr[i]);
+        }
       }
       inodeAttrs = getAttributesProvider().getAttributes(elements, inodeAttrs);
     }
@@ -401,7 +409,7 @@ class FSPermissionChecker implements AccessControlEnforcer {
     }
     final FsPermission mode = inode.getFsPermission();
     final AclFeature aclFeature = inode.getAclFeature();
-    if (aclFeature != null) {
+    if (aclFeature != null && aclFeature.getEntriesSize() > 0) {
       // It's possible that the inode has a default ACL but no access ACL.
       int firstEntry = aclFeature.getEntryAt(0);
       if (AclEntryStatusFormat.getScope(firstEntry) == AclEntryScope.ACCESS) {
@@ -565,7 +573,9 @@ class FSPermissionChecker implements AccessControlEnforcer {
         && mode.getGroupAction().implies(access)) {
       return;
     }
-    if (mode.getOtherAction().implies(access)) {
+    if (!getUser().equals(pool.getOwnerName())
+        && !isMemberOfGroup(pool.getGroupName())
+        && mode.getOtherAction().implies(access)) {
       return;
     }
     throw new AccessControlException("Permission denied while accessing pool "

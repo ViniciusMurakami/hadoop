@@ -36,8 +36,8 @@ import java.util.TreeSet;
 import java.util.concurrent.ThreadLocalRandom;
 
 import org.apache.commons.io.IOUtils;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
@@ -112,7 +112,8 @@ import com.google.common.annotations.VisibleForTesting;
  */
 @InterfaceAudience.Private
 public class NamenodeFsck implements DataEncryptionKeyFactory {
-  public static final Log LOG = LogFactory.getLog(NameNode.class.getName());
+  public static final Logger LOG =
+      LoggerFactory.getLogger(NameNode.class.getName());
 
   // return string marking fsck status
   public static final String CORRUPT_STATUS = "is CORRUPT";
@@ -264,12 +265,13 @@ public class NamenodeFsck implements DataEncryptionKeyFactory {
       return;
     }
 
+    namenode.getNamesystem().readLock();
     try {
       //get blockInfo
       Block block = new Block(Block.getBlockId(blockId));
       //find which file this block belongs to
       BlockInfo blockInfo = blockManager.getStoredBlock(block);
-      if(blockInfo == null) {
+      if (blockInfo == null || blockInfo.isDeleted()) {
         out.println("Block "+ blockId +" " + NONEXISTENT_STATUS);
         LOG.warn("Block "+ blockId + " " + NONEXISTENT_STATUS);
         return;
@@ -329,6 +331,8 @@ public class NamenodeFsck implements DataEncryptionKeyFactory {
       out.println(e.getMessage());
       out.print("\n\n" + errMsg);
       LOG.warn("Error in looking up block", e);
+    } finally {
+      namenode.getNamesystem().readUnlock("fsck");
     }
   }
 
@@ -355,7 +359,7 @@ public class NamenodeFsck implements DataEncryptionKeyFactory {
           blockIdCK(blk);
           sb.append(blk + "\n");
         }
-        LOG.info(sb);
+        LOG.info("{}", sb.toString());
         namenode.getNamesystem().logFsckEvent("/", remoteAddress);
         out.flush();
         return;
@@ -471,7 +475,14 @@ public class NamenodeFsck implements DataEncryptionKeyFactory {
   void check(String parent, HdfsFileStatus file, Result replRes, Result ecRes)
       throws IOException {
     String path = file.getFullName(parent);
-    if (file.isDir()) {
+    if (showprogress &&
+        (totalDirs + totalSymlinks + replRes.totalFiles + ecRes.totalFiles)
+            % 100 == 0) {
+      out.println();
+      out.flush();
+    }
+
+    if (file.isDirectory()) {
       checkDir(path, replRes, ecRes);
       return;
     }
@@ -489,10 +500,6 @@ public class NamenodeFsck implements DataEncryptionKeyFactory {
 
     final Result r = file.getErasureCodingPolicy() != null ? ecRes: replRes;
     collectFileSummary(path, file, r, blocks);
-    if (showprogress && (replRes.totalFiles + ecRes.totalFiles) % 100 == 0) {
-      out.println();
-      out.flush();
-    }
     collectBlocksSummary(parent, file, r, blocks);
   }
 
@@ -1029,7 +1036,6 @@ public class NamenodeFsck implements DataEncryptionKeyFactory {
             setCachingStrategy(CachingStrategy.newDropBehind()).
             setClientCacheContext(dfs.getClientContext()).
             setConfiguration(namenode.getConf()).
-            setTracer(tracer).
             setRemotePeerFactory(new RemotePeerFactory() {
               @Override
               public Peer newConnectedPeer(InetSocketAddress addr,
@@ -1115,7 +1121,7 @@ public class NamenodeFsck implements DataEncryptionKeyFactory {
       if (lfStatus == null) { // not exists
         lfInitedOk = dfs.mkdirs(lfName, null, true);
         lostFound = lfName;
-      } else if (!lfStatus.isDir()) { // exists but not a directory
+      } else if (!lfStatus.isDirectory()) { // exists but not a directory
         LOG.warn("Cannot use /lost+found : a regular file with this name exists.");
         lfInitedOk = false;
       }  else { // exists and is a directory
@@ -1233,7 +1239,7 @@ public class NamenodeFsck implements DataEncryptionKeyFactory {
                 ((float) (numUnderMinReplicatedBlocks * 100) / (float) totalBlocks))
                 .append(" %)");
           }
-          res.append("\n  ").append(DFSConfigKeys.DFS_NAMENODE_REPLICATION_MIN_KEY + ":\t")
+          res.append("\n  ").append("MINIMAL BLOCK REPLICATION:\t")
              .append(minReplication);
         }
         if(corruptFiles>0) {

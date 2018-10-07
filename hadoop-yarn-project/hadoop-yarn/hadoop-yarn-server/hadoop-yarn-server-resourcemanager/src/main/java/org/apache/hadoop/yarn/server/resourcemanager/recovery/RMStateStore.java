@@ -47,7 +47,9 @@ import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
 import org.apache.hadoop.yarn.api.records.ReservationId;
 import org.apache.hadoop.yarn.api.records.impl.pb.ApplicationSubmissionContextPBImpl;
+import org.apache.hadoop.yarn.api.records.impl.pb.ContainerLaunchContextPBImpl;
 import org.apache.hadoop.yarn.conf.HAUtil;
+import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.event.AsyncDispatcher;
 import org.apache.hadoop.yarn.event.Dispatcher;
 import org.apache.hadoop.yarn.event.EventHandler;
@@ -64,6 +66,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.Applicatio
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEventType;
+import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppState;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.AggregateAppResourceUsage;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttempt;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptEvent;
@@ -88,6 +91,8 @@ public abstract class RMStateStore extends AbstractService {
   @VisibleForTesting
   public static final String RM_APP_ROOT = "RMAppRoot";
   protected static final String RM_DT_SECRET_MANAGER_ROOT = "RMDTSecretManagerRoot";
+  protected static final String RM_DELEGATION_TOKENS_ROOT_ZNODE_NAME =
+      "RMDelegationTokensRoot";
   protected static final String DELEGATION_KEY_PREFIX = "DelegationKey_";
   protected static final String DELEGATION_TOKEN_PREFIX = "RMDelegationToken_";
   protected static final String DELEGATION_TOKEN_SEQUENCE_NUMBER_PREFIX =
@@ -98,6 +103,8 @@ public abstract class RMStateStore extends AbstractService {
       "ReservationSystemRoot";
   protected static final String VERSION_NODE = "RMVersionNode";
   protected static final String EPOCH_NODE = "EpochNode";
+  protected long baseEpoch;
+  private long epochRange;
   protected ResourceManager resourceManager;
   private final ReadLock readLock;
   private final WriteLock writeLock;
@@ -221,8 +228,9 @@ public abstract class RMStateStore extends AbstractService {
       } catch (Exception e) {
         LOG.error("Error storing app: " + appId, e);
         if (e instanceof StoreLimitException) {
-          store.notifyApplication(new RMAppEvent(appId,
-              RMAppEventType.APP_REJECTED, e.getMessage(), false));
+          store.notifyApplication(
+              new RMAppEvent(appId, RMAppEventType.APP_SAVE_FAILED,
+                  e.getMessage()));
         } else {
           isFenced = store.notifyStoreOperationFailedInternal(e);
         }
@@ -252,6 +260,9 @@ public abstract class RMStateStore extends AbstractService {
           appState.getApplicationSubmissionContext().getApplicationId();
       LOG.info("Updating info for app: " + appId);
       try {
+        if (isAppStateFinal(appState)) {
+          pruneAppState(appState);
+        }
         store.updateApplicationStateInternal(appId, appState);
         if (((RMStateUpdateAppEvent) event).isNotifyApplication()) {
           store.notifyApplication(new RMAppEvent(appId,
@@ -271,7 +282,39 @@ public abstract class RMStateStore extends AbstractService {
         }
       }
       return finalState(isFenced);
-    };
+    }
+
+    private boolean isAppStateFinal(ApplicationStateData appState) {
+      RMAppState state = appState.getState();
+      return state == RMAppState.FINISHED || state == RMAppState.FAILED ||
+          state == RMAppState.KILLED;
+    }
+
+    private void pruneAppState(ApplicationStateData appState) {
+      ApplicationSubmissionContext srcCtx =
+          appState.getApplicationSubmissionContext();
+      ApplicationSubmissionContextPBImpl context =
+          new ApplicationSubmissionContextPBImpl();
+      // most fields in the ApplicationSubmissionContext are not needed,
+      // but the following few need to be present for recovery to succeed
+      context.setApplicationId(srcCtx.getApplicationId());
+      context.setResource(srcCtx.getResource());
+      context.setQueue(srcCtx.getQueue());
+      context.setAMContainerResourceRequests(
+          srcCtx.getAMContainerResourceRequests());
+      context.setApplicationName(srcCtx.getApplicationName());
+      context.setPriority(srcCtx.getPriority());
+      context.setApplicationTags(srcCtx.getApplicationTags());
+      context.setApplicationType(srcCtx.getApplicationType());
+      context.setUnmanagedAM(srcCtx.getUnmanagedAM());
+      context.setNodeLabelExpression(srcCtx.getNodeLabelExpression());
+      ContainerLaunchContextPBImpl amContainerSpec =
+              new ContainerLaunchContextPBImpl();
+      amContainerSpec.setApplicationACLs(
+              srcCtx.getAMContainerSpec().getApplicationACLs());
+      context.setAMContainerSpec(amContainerSpec);
+      appState.setApplicationSubmissionContext(context);
+    }
   }
 
   private static class RemoveAppTransition implements
@@ -689,6 +732,11 @@ public abstract class RMStateStore extends AbstractService {
     dispatcher.register(RMStateStoreEventType.class, 
                         rmStateStoreEventHandler);
     dispatcher.setDrainEventsOnStop();
+    // read the base epoch value from conf
+    baseEpoch = conf.getLong(YarnConfiguration.RM_EPOCH,
+        YarnConfiguration.DEFAULT_RM_EPOCH);
+    epochRange = conf.getLong(YarnConfiguration.RM_EPOCH_RANGE,
+        YarnConfiguration.DEFAULT_RM_EPOCH_RANGE);
     initInternal(conf);
   }
 
@@ -775,7 +823,20 @@ public abstract class RMStateStore extends AbstractService {
    * Get the current epoch of RM and increment the value.
    */
   public abstract long getAndIncrementEpoch() throws Exception;
-  
+
+  /**
+   * Compute the next epoch value by incrementing by one.
+   * Wraps around if the epoch range is exceeded so that
+   * when federation is enabled epoch collisions can be avoided.
+   */
+  protected long nextEpoch(long epoch){
+    long epochVal = epoch - baseEpoch + 1;
+    if (epochRange > 0) {
+      epochVal %= epochRange;
+    }
+    return  epochVal + baseEpoch;
+  }
+
   /**
    * Blocking API
    * The derived class must recover state from the store and return a new 
@@ -845,11 +906,8 @@ public abstract class RMStateStore extends AbstractService {
             appAttempt.getAppAttemptId(),
             appAttempt.getMasterContainer(),
             credentials, appAttempt.getStartTime(),
-            resUsage.getMemorySeconds(),
-            resUsage.getVcoreSeconds(),
-            attempMetrics.getPreemptedMemory(),
-            attempMetrics.getPreemptedVcore()
-            );
+            resUsage.getResourceUsageSecondsMap(),
+            attempMetrics.getPreemptedResourceSecondsMap());
 
     getRMStateStoreEventHandler().handle(
       new RMStateStoreAppAttemptEvent(attemptState));

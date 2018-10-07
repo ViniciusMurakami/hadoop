@@ -20,7 +20,7 @@ package org.apache.hadoop.fs.s3a;
 
 import static org.apache.hadoop.fs.contract.ContractTestUtils.skip;
 
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 
 /**
@@ -39,9 +39,7 @@ public class ITestS3AEncryptionSSEKMSUserDefinedKeyBlockOutputStream
       skip(Constants.SERVER_SIDE_ENCRYPTION_KEY+ " is not set for " +
           S3AEncryptionMethods.SSE_KMS.getMethod());
     }
-    conf.setBoolean(Constants.FAST_UPLOAD, true);
-    conf.set(Constants.FAST_UPLOAD_BUFFER,
-        Constants.FAST_UPLOAD_BYTEBUFFER);
+    conf.set(Constants.FAST_UPLOAD_BUFFER, Constants.FAST_UPLOAD_BYTEBUFFER);
     return conf;
   }
 

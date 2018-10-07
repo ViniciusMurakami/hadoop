@@ -18,23 +18,30 @@
 package org.apache.hadoop.hdfs.protocol;
 
 import com.google.common.base.Preconditions;
-import org.apache.commons.lang.builder.EqualsBuilder;
-import org.apache.commons.lang.builder.HashCodeBuilder;
+import org.apache.commons.lang3.builder.EqualsBuilder;
+import org.apache.commons.lang3.builder.HashCodeBuilder;
 import org.apache.hadoop.classification.InterfaceAudience;
-import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.io.erasurecode.ECSchema;
+import org.apache.hadoop.io.erasurecode.ErasureCodeConstants;
+
+import java.io.Serializable;
 
 /**
  * A policy about how to write/read/code an erasure coding file.
+ * <p>
+ * Note this class should be lightweight and immutable, because it's cached
+ * by {@link SystemErasureCodingPolicies}, to be returned as a part of
+ * {@link HdfsFileStatus}.
  */
-@InterfaceAudience.Public
-@InterfaceStability.Evolving
-public final class ErasureCodingPolicy {
+@InterfaceAudience.Private
+public final class ErasureCodingPolicy implements Serializable {
 
+  private static final long serialVersionUID = 0x0079fe4e;
+
+  private final String name;
   private final ECSchema schema;
   private final int cellSize;
-  private String name;
-  private byte id;
+  private final byte id;
 
   public ErasureCodingPolicy(String name, ECSchema schema,
       int cellSize, byte id) {
@@ -71,10 +78,6 @@ public final class ErasureCodingPolicy {
     return name;
   }
 
-  public void setName(String name) {
-    this.name = name;
-  }
-
   public ECSchema getSchema() {
     return schema;
   }
@@ -99,8 +102,12 @@ public final class ErasureCodingPolicy {
     return id;
   }
 
-  public void setId(byte id) {
-    this.id = id;
+  public boolean isReplicationPolicy() {
+    return (id == ErasureCodeConstants.REPLICATION_POLICY_ID);
+  }
+
+  public boolean isSystemPolicy() {
+    return (this.id < ErasureCodeConstants.USER_DEFINED_POLICY_START_ID);
   }
 
   @Override

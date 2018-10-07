@@ -19,13 +19,14 @@ package org.apache.hadoop.hdfs.protocol;
 
 import java.io.IOException;
 import java.util.EnumSet;
-import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.crypto.CryptoProtocolVersion;
 import org.apache.hadoop.fs.BatchedRemoteIterator.BatchedEntries;
+import org.apache.hadoop.fs.PathIsNotEmptyDirectoryException;
 import org.apache.hadoop.hdfs.AddBlockFlag;
 import org.apache.hadoop.fs.CacheFlag;
 import org.apache.hadoop.fs.ContentSummary;
@@ -41,7 +42,9 @@ import org.apache.hadoop.fs.permission.AclStatus;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.inotify.EventBatchList;
+import org.apache.hadoop.hdfs.protocol.HdfsConstants.ReencryptAction;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.RollingUpgradeAction;
+import org.apache.hadoop.hdfs.protocol.OpenFilesIterator.OpenFilesType;
 import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
 import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
 import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSelector;
@@ -623,6 +626,8 @@ public interface ClientProtocol {
    * @throws org.apache.hadoop.fs.UnresolvedLinkException If <code>src</code>
    *           contains a symlink
    * @throws SnapshotAccessControlException if path is in RO snapshot
+   * @throws PathIsNotEmptyDirectoryException if path is a non-empty directory
+   *           and <code>recursive</code> is set to false
    * @throws IOException If an I/O error occurred
    */
   @AtMostOnce
@@ -777,14 +782,14 @@ public interface ClientProtocol {
    * in the filesystem.
    */
   @Idempotent
-  BlocksStats getBlocksStats() throws IOException;
+  ReplicatedBlockStats getReplicatedBlockStats() throws IOException;
 
   /**
    * Get statistics pertaining to blocks of type {@link BlockType#STRIPED}
    * in the filesystem.
    */
   @Idempotent
-  ECBlockGroupsStats getECBlockGroupsStats() throws IOException;
+  ECBlockGroupStats getECBlockGroupStats() throws IOException;
 
   /**
    * Get a report on the system's current datanodes.
@@ -834,7 +839,7 @@ public interface ClientProtocol {
    * percentage called threshold of blocks, which satisfy the minimal
    * replication condition.
    * The minimal replication condition is that each block must have at least
-   * <tt>dfs.namenode.replication.min</tt> replicas.
+   * {@code dfs.namenode.replication.min} replicas.
    * When the threshold is reached the name node extends safe mode
    * for a configurable amount of time
    * to let the remaining data nodes to check in before it
@@ -850,12 +855,13 @@ public interface ClientProtocol {
    * Current state of the name node can be verified using
    * {@link #setSafeMode(HdfsConstants.SafeModeAction,boolean)
    * setSafeMode(SafeModeAction.SAFEMODE_GET,false)}
-   * <h4>Configuration parameters:</h4>
-   * <tt>dfs.safemode.threshold.pct</tt> is the threshold parameter.<br>
-   * <tt>dfs.safemode.extension</tt> is the safe mode extension parameter.<br>
-   * <tt>dfs.namenode.replication.min</tt> is the minimal replication parameter.
    *
-   * <h4>Special cases:</h4>
+   * <p><b>Configuration parameters:</b></p>
+   * {@code dfs.safemode.threshold.pct} is the threshold parameter.<br>
+   * {@code dfs.safemode.extension} is the safe mode extension parameter.<br>
+   * {@code dfs.namenode.replication.min} is the minimal replication parameter.
+   *
+   * <p><b>Special cases:</b></p>
    * The name node does not enter safe mode at startup if the threshold is
    * set to 0 or if the name space is empty.<br>
    * If the threshold is set to 1 then all blocks need to have at least
@@ -934,6 +940,15 @@ public interface ClientProtocol {
    */
   @Idempotent
   void finalizeUpgrade() throws IOException;
+
+  /**
+   * Get status of upgrade - finalized or not.
+   * @return true if upgrade is finalized or if no upgrade is in progress and
+   * false otherwise.
+   * @throws IOException
+   */
+  @Idempotent
+  boolean upgradeStatus() throws IOException;
 
   /**
    * Rolling upgrade operations.
@@ -1022,6 +1037,21 @@ public interface ClientProtocol {
    */
   @Idempotent
   HdfsFileStatus getFileLinkInfo(String src) throws IOException;
+
+  /**
+   * Get the file info for a specific file or directory with
+   * {@link LocatedBlocks}.
+   * @param src The string representation of the path to the file
+   * @param needBlockToken Generate block tokens for {@link LocatedBlocks}
+   * @return object containing information regarding the file
+   *         or null if file not found
+   * @throws org.apache.hadoop.security.AccessControlException permission denied
+   * @throws java.io.FileNotFoundException file <code>src</code> is not found
+   * @throws IOException If an I/O error occurred
+   */
+  @Idempotent
+  HdfsLocatedFileStatus getLocatedFileInfo(String src, boolean needBlockToken)
+      throws IOException;
 
   /**
    * Get {@link ContentSummary} rooted at the specified directory.
@@ -1182,7 +1212,6 @@ public interface ClientProtocol {
    * Get a valid Delegation Token.
    *
    * @param renewer the designated renewer for the token
-   * @return Token<DelegationTokenIdentifier>
    * @throws IOException
    */
   @Idempotent
@@ -1286,6 +1315,34 @@ public interface ClientProtocol {
   @Idempotent
   SnapshotDiffReport getSnapshotDiffReport(String snapshotRoot,
       String fromSnapshot, String toSnapshot) throws IOException;
+
+  /**
+   * Get the difference between two snapshots of a directory iteratively.
+   *
+   * @param snapshotRoot
+   *          full path of the directory where snapshots are taken
+   * @param fromSnapshot
+   *          snapshot name of the from point. Null indicates the current
+   *          tree
+   * @param toSnapshot
+   *          snapshot name of the to point. Null indicates the current
+   *          tree.
+   * @param startPath
+   *          path relative to the snapshottable root directory from where the
+   *          snapshotdiff computation needs to start across multiple rpc calls
+   * @param index
+   *           index in the created or deleted list of the directory at which
+   *           the snapshotdiff computation stopped during the last rpc call
+   *           as the no of entries exceeded the snapshotdiffentry limit. -1
+   *           indicates, the snapshotdiff compuatation needs to start right
+   *           from the startPath provided.
+   * @return The difference report represented as a {@link SnapshotDiffReport}.
+   * @throws IOException on error
+   */
+  @Idempotent
+  SnapshotDiffReportListing getSnapshotDiffReportListing(String snapshotRoot,
+      String fromSnapshot, String toSnapshot, byte[] startPath, int index)
+      throws IOException;
 
   /**
    * Add a CacheDirective to the CacheManager.
@@ -1433,7 +1490,7 @@ public interface ClientProtocol {
     throws IOException;
 
   /**
-   * Used to implement cursor-based batched listing of {@EncryptionZone}s.
+   * Used to implement cursor-based batched listing of {@link EncryptionZone}s.
    *
    * @param prevId ID of the last item in the previous batch. If there is no
    *               previous batch, a negative value can be used.
@@ -1444,10 +1501,34 @@ public interface ClientProtocol {
       long prevId) throws IOException;
 
   /**
+   * Used to implement re-encryption of encryption zones.
+   *
+   * @param zone the encryption zone to re-encrypt.
+   * @param action the action for the re-encryption.
+   * @throws IOException
+   */
+  @AtMostOnce
+  void reencryptEncryptionZone(String zone, ReencryptAction action)
+      throws IOException;
+
+  /**
+   * Used to implement cursor-based batched listing of
+   * {@link ZoneReencryptionStatus}s.
+   *
+   * @param prevId ID of the last item in the previous batch. If there is no
+   *               previous batch, a negative value can be used.
+   * @return Batch of encryption zones.
+   * @throws IOException
+   */
+  @Idempotent
+  BatchedEntries<ZoneReencryptionStatus> listReencryptionStatus(long prevId)
+      throws IOException;
+
+  /**
    * Set xattr of a file or directory.
    * The name must be prefixed with the namespace followed by ".". For example,
    * "user.attr".
-   * <p/>
+   * <p>
    * Refer to the HDFS extended attributes user documentation for details.
    *
    * @param src file or directory
@@ -1464,12 +1545,12 @@ public interface ClientProtocol {
    * If xAttrs is null or empty, this is the same as getting all xattrs of the
    * file or directory.  Only those xattrs for which the logged-in user has
    * permissions to view are returned.
-   * <p/>
+   * <p>
    * Refer to the HDFS extended attributes user documentation for details.
    *
    * @param src file or directory
    * @param xAttrs xAttrs to get
-   * @return List<XAttr> <code>XAttr</code> list
+   * @return <code>XAttr</code> list
    * @throws IOException
    */
   @Idempotent
@@ -1480,11 +1561,11 @@ public interface ClientProtocol {
    * List the xattrs names for a file or directory.
    * Only the xattr names for which the logged in user has the permissions to
    * access will be returned.
-   * <p/>
+   * <p>
    * Refer to the HDFS extended attributes user documentation for details.
    *
    * @param src file or directory
-   * @return List<XAttr> <code>XAttr</code> list
+   * @return <code>XAttr</code> list
    * @throws IOException
    */
   @Idempotent
@@ -1495,7 +1576,7 @@ public interface ClientProtocol {
    * Remove xattr of a file or directory.Value in xAttr parameter is ignored.
    * The name must be prefixed with the namespace followed by ".". For example,
    * "user.attr".
-   * <p/>
+   * <p>
    * Refer to the HDFS extended attributes user documentation for details.
    *
    * @param src file or directory
@@ -1559,7 +1640,7 @@ public interface ClientProtocol {
    * @throws IOException
    */
   @AtMostOnce
-  AddECPolicyResponse[] addErasureCodingPolicies(
+  AddErasureCodingPolicyResponse[] addErasureCodingPolicies(
       ErasureCodingPolicy[] policies) throws IOException;
 
   /**
@@ -1588,12 +1669,13 @@ public interface ClientProtocol {
 
 
   /**
-   * Get the erasure coding policies loaded in Namenode.
+   * Get the erasure coding policies loaded in Namenode, excluding REPLICATION
+   * policy.
    *
    * @throws IOException
    */
   @Idempotent
-  ErasureCodingPolicy[] getErasureCodingPolicies() throws IOException;
+  ErasureCodingPolicyInfo[] getErasureCodingPolicies() throws IOException;
 
   /**
    * Get the erasure coding codecs loaded in Namenode.
@@ -1601,10 +1683,11 @@ public interface ClientProtocol {
    * @throws IOException
    */
   @Idempotent
-  HashMap<String, String> getErasureCodingCodecs() throws IOException;
+  Map<String, String> getErasureCodingCodecs() throws IOException;
 
   /**
-   * Get the information about the EC policy for the path.
+   * Get the information about the EC policy for the path. Null will be returned
+   * if directory or file has REPLICATION policy.
    *
    * @param src path to get the info for
    * @throws IOException
@@ -1642,5 +1725,35 @@ public interface ClientProtocol {
    * @throws IOException
    */
   @Idempotent
+  @Deprecated
   BatchedEntries<OpenFileEntry> listOpenFiles(long prevId) throws IOException;
+
+  /**
+   * List open files in the system in batches. INode id is the cursor and the
+   * open files returned in a batch will have their INode ids greater than
+   * the cursor INode id. Open files can only be requested by super user and
+   * the the list across batches are not atomic.
+   *
+   * @param prevId the cursor INode id.
+   * @param openFilesTypes types to filter the open files.
+   * @param path path to filter the open files.
+   * @throws IOException
+   */
+  @Idempotent
+  BatchedEntries<OpenFileEntry> listOpenFiles(long prevId,
+      EnumSet<OpenFilesType> openFilesTypes, String path) throws IOException;
+
+  /**
+   * Satisfy the storage policy for a file/directory.
+   * @param path Path of an existing file/directory.
+   * @throws AccessControlException If access is denied.
+   * @throws org.apache.hadoop.fs.UnresolvedLinkException if <code>src</code>
+   *           contains a symlink.
+   * @throws java.io.FileNotFoundException If file/dir <code>src</code> is not
+   *           found.
+   * @throws org.apache.hadoop.hdfs.server.namenode.SafeModeException append not
+   *           allowed in safemode.
+   */
+  @AtMostOnce
+  void satisfyStoragePolicy(String path) throws IOException;
 }

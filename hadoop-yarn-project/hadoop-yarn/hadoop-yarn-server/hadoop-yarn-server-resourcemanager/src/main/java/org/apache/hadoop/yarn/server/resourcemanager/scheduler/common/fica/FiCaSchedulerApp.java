@@ -39,6 +39,7 @@ import org.apache.hadoop.yarn.api.records.ContainerStatus;
 import org.apache.hadoop.yarn.api.records.NMToken;
 import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.NodeLabel;
+import org.apache.hadoop.yarn.api.records.NodeState;
 import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
@@ -56,7 +57,9 @@ import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerRese
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerState;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractUsersManager;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.Allocation;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.AppSchedulingInfo;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.Queue;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueResourceQuotas;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceLimits;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ResourceScheduler;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedContainerChangeRequest;
@@ -72,12 +75,14 @@ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.QueueCap
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.SchedulingMode;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.allocator.AbstractContainerAllocator;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.allocator.ContainerAllocator;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.ApplicationSchedulingConfig;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.ContainerAllocationProposal;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.ContainerRequest;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.PendingAsk;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.ResourceCommitRequest;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.SchedulerContainer;
-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.placement.PlacementSet;
-import org.apache.hadoop.yarn.server.resourcemanager.scheduler.placement.SchedulingPlacementSet;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.placement.AppPlacementAllocator;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.placement.CandidateNodeSet;
 import org.apache.hadoop.yarn.server.scheduler.SchedulerRequestKey;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
 import org.apache.hadoop.yarn.util.resource.DefaultResourceCalculator;
@@ -166,8 +171,30 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
       rc = scheduler.getResourceCalculator();
     }
 
+    // Update multi-node sorting algorithm to scheduler envs
+    updateMultiNodeSortingPolicy(rmApp);
+
     containerAllocator = new ContainerAllocator(this, rc, rmContext,
         activitiesManager);
+  }
+
+  private void updateMultiNodeSortingPolicy(RMApp rmApp) {
+    if (rmApp == null) {
+      return;
+    }
+
+    String queueName = null;
+    if (scheduler instanceof CapacityScheduler) {
+      queueName = getCSLeafQueue().getMultiNodeSortingPolicyName();
+    }
+
+    if (!appSchedulingInfo.getApplicationSchedulingEnvs().containsKey(
+        ApplicationSchedulingConfig.ENV_MULTI_NODE_SORTING_POLICY_CLASS)
+        && queueName != null) {
+      appSchedulingInfo.getApplicationSchedulingEnvs().put(
+          ApplicationSchedulingConfig.ENV_MULTI_NODE_SORTING_POLICY_CLASS,
+          queueName);
+    }
   }
 
   public boolean containerCompleted(RMContainer rmContainer,
@@ -224,10 +251,10 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
         return null;
       }
 
-      SchedulingPlacementSet<FiCaSchedulerNode> ps =
-          appSchedulingInfo.getSchedulingPlacementSet(schedulerKey);
+      AppPlacementAllocator<FiCaSchedulerNode> ps =
+          appSchedulingInfo.getAppPlacementAllocator(schedulerKey);
       if (null == ps) {
-        LOG.warn("Failed to get " + SchedulingPlacementSet.class.getName()
+        LOG.warn("Failed to get " + AppPlacementAllocator.class.getName()
             + " for application=" + getApplicationId() + " schedulerRequestKey="
             + schedulerKey);
         return null;
@@ -314,13 +341,17 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
   }
 
   private boolean commonCheckContainerAllocation(
-      Resource cluster,
       ContainerAllocationProposal<FiCaSchedulerApp, FiCaSchedulerNode> allocation,
       SchedulerContainer<FiCaSchedulerApp, FiCaSchedulerNode> schedulerContainer) {
     // Make sure node is not reserved by anyone else
     RMContainer reservedContainerOnNode =
         schedulerContainer.getSchedulerNode().getReservedContainer();
     if (reservedContainerOnNode != null) {
+      // adding NP check as this proposal could not be allocated from reserved
+      // container in async-scheduling mode
+      if (allocation.getAllocateFromReservedContainer() == null) {
+        return false;
+      }
       RMContainer fromReservedContainer =
           allocation.getAllocateFromReservedContainer().getRmContainer();
 
@@ -331,6 +362,16 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
         }
         return false;
       }
+    }
+    // If allocate from reserved container, make sure node is still reserved
+    if (allocation.getAllocateFromReservedContainer() != null
+        && reservedContainerOnNode == null) {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Try to allocate from reserved container " + allocation
+            .getAllocateFromReservedContainer().getRmContainer()
+            .getContainerId() + ", but node is not reserved");
+      }
+      return false;
     }
 
     // Do we have enough space on this node?
@@ -344,6 +385,21 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
         .isEmpty()) {
       for (SchedulerContainer<FiCaSchedulerApp, FiCaSchedulerNode>
           releaseContainer : allocation.getToRelease()) {
+        // Make sure to-release reserved containers are not outdated
+        if (releaseContainer.getRmContainer().getState()
+            == RMContainerState.RESERVED
+            && releaseContainer.getRmContainer() != releaseContainer
+            .getSchedulerNode().getReservedContainer()) {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("Failed to accept this proposal because "
+                + "it tries to release an outdated reserved container "
+                + releaseContainer.getRmContainer().getContainerId()
+                + " on node " + releaseContainer.getSchedulerNode().getNodeID()
+                + " whose reserved container is "
+                + releaseContainer.getSchedulerNode().getReservedContainer());
+          }
+          return false;
+        }
         // Only consider non-reserved container (reserved container will
         // not affect available resource of node) on the same node
         if (releaseContainer.getRmContainer().getState()
@@ -355,8 +411,7 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
         }
       }
     }
-    if (!Resources.fitsIn(rc, cluster,
-        allocation.getAllocatedOrReservedResource(),
+    if (!Resources.fitsIn(rc, allocation.getAllocatedOrReservedResource(),
         availableResource)) {
       if (LOG.isDebugEnabled()) {
         LOG.debug("Node doesn't have enough available resource, asked="
@@ -370,8 +425,9 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
   }
 
   public boolean accept(Resource cluster,
-      ResourceCommitRequest<FiCaSchedulerApp, FiCaSchedulerNode> request) {
-    List<ResourceRequest> resourceRequests = null;
+      ResourceCommitRequest<FiCaSchedulerApp, FiCaSchedulerNode> request,
+      boolean checkPending) {
+    ContainerRequest containerRequest = null;
     boolean reReservation = false;
 
     try {
@@ -397,15 +453,28 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
         SchedulerContainer<FiCaSchedulerApp, FiCaSchedulerNode>
             schedulerContainer = allocation.getAllocatedOrReservedContainer();
 
+        // Make sure node is in RUNNING state
+        if (schedulerContainer.getSchedulerNode().getRMNode().getState()
+            != NodeState.RUNNING) {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("Failed to accept this proposal because node "
+                + schedulerContainer.getSchedulerNode().getNodeID() + " is in "
+                + schedulerContainer.getSchedulerNode().getRMNode().getState()
+                + " state (not RUNNING)");
+          }
+          return false;
+        }
         if (schedulerContainer.isAllocated()) {
           // When allocate a new container
-          resourceRequests =
-              schedulerContainer.getRmContainer().getResourceRequests();
+          containerRequest =
+              schedulerContainer.getRmContainer().getContainerRequest();
 
           // Check pending resource request
-          if (!appSchedulingInfo.checkAllocation(allocation.getAllocationLocalityType(),
-              schedulerContainer.getSchedulerNode(),
-              schedulerContainer.getSchedulerRequestKey())) {
+          if (checkPending &&
+              !appSchedulingInfo.checkAllocation(
+                  allocation.getAllocationLocalityType(),
+                  schedulerContainer.getSchedulerNode(),
+                  schedulerContainer.getSchedulerRequestKey())) {
             if (LOG.isDebugEnabled()) {
               LOG.debug("No pending resource for: nodeType=" + allocation
                   .getAllocationLocalityType() + ", node=" + schedulerContainer
@@ -419,13 +488,27 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
 
           // Common part of check container allocation regardless if it is a
           // increase container or regular container
-          commonCheckContainerAllocation(cluster, allocation,
-              schedulerContainer);
+          if (!commonCheckContainerAllocation(allocation, schedulerContainer)) {
+            return false;
+          }
         } else {
           // Container reserved first time will be NEW, after the container
           // accepted & confirmed, it will become RESERVED state
           if (schedulerContainer.getRmContainer().getState()
               == RMContainerState.RESERVED) {
+            // Check if node currently reserved by other application, there may
+            // be some outdated proposals in async-scheduling environment
+            if (schedulerContainer.getRmContainer() != schedulerContainer
+                .getSchedulerNode().getReservedContainer()) {
+              if (LOG.isDebugEnabled()) {
+                LOG.debug("Try to re-reserve a container, but node "
+                    + schedulerContainer.getSchedulerNode()
+                    + " is already reserved by another container="
+                    + schedulerContainer.getSchedulerNode()
+                    .getReservedContainer());
+              }
+              return false;
+            }
             // Set reReservation == true
             reReservation = true;
           } else {
@@ -459,15 +542,15 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
     }
 
     // When rejected, recover resource requests for this app
-    if (!accepted && resourceRequests != null) {
-      recoverResourceRequestsForContainer(resourceRequests);
+    if (!accepted && containerRequest != null) {
+      recoverResourceRequestsForContainer(containerRequest);
     }
 
     return accepted;
   }
 
-  public void apply(Resource cluster,
-      ResourceCommitRequest<FiCaSchedulerApp, FiCaSchedulerNode> request) {
+  public boolean apply(Resource cluster, ResourceCommitRequest<FiCaSchedulerApp,
+      FiCaSchedulerNode> request, boolean updatePending) {
     boolean reReservation = false;
 
     try {
@@ -479,8 +562,16 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
             allocation = request.getFirstAllocatedOrReservedContainer();
         SchedulerContainer<FiCaSchedulerApp, FiCaSchedulerNode>
             schedulerContainer = allocation.getAllocatedOrReservedContainer();
-        RMContainer rmContainer = schedulerContainer.getRmContainer();
 
+        // Required sanity check - AM can call 'allocate' to update resource
+        // request without locking the scheduler, hence we need to check
+        if (updatePending &&
+            getOutstandingAsksCount(schedulerContainer.getSchedulerRequestKey())
+                <= 0) {
+          return false;
+        }
+
+        RMContainer rmContainer = schedulerContainer.getRmContainer();
         reReservation =
             (!schedulerContainer.isAllocated()) && (rmContainer.getState()
                 == RMContainerState.RESERVED);
@@ -512,12 +603,28 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
           liveContainers.put(containerId, rmContainer);
 
           // Deduct pending resource requests
-          List<ResourceRequest> requests = appSchedulingInfo.allocate(
-              allocation.getAllocationLocalityType(),
-              schedulerContainer.getSchedulerNode(),
-              schedulerContainer.getSchedulerRequestKey(),
-              schedulerContainer.getRmContainer().getContainer());
-          ((RMContainerImpl) rmContainer).setResourceRequests(requests);
+          if (updatePending) {
+            ContainerRequest containerRequest = appSchedulingInfo.allocate(
+                allocation.getAllocationLocalityType(),
+                schedulerContainer.getSchedulerNode(),
+                schedulerContainer.getSchedulerRequestKey(),
+                schedulerContainer.getRmContainer().getContainer());
+            ((RMContainerImpl) rmContainer).setContainerRequest(
+                containerRequest);
+
+            // If this is from a SchedulingRequest, set allocation tags.
+            if (containerRequest != null
+                && containerRequest.getSchedulingRequest() != null) {
+              ((RMContainerImpl) rmContainer).setAllocationTags(
+                  containerRequest.getSchedulingRequest().getAllocationTags());
+            }
+          } else {
+            AppSchedulingInfo.updateMetrics(getApplicationId(),
+                allocation.getAllocationLocalityType(),
+                schedulerContainer.getSchedulerNode(),
+                schedulerContainer.getRmContainer().getContainer(), getUser(),
+                getQueue());
+          }
 
           attemptResourceUsage.incUsed(schedulerContainer.getNodePartition(),
               allocation.getAllocatedOrReservedResource());
@@ -550,6 +657,11 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
               schedulerContainer.getRmContainer(),
               schedulerContainer.getRmContainer().getContainer(),
               reReservation);
+
+          LOG.info("Reserved container=" + rmContainer.getContainerId()
+              + ", on node=" + schedulerContainer.getSchedulerNode()
+              + " with resource=" + rmContainer
+              .getAllocatedOrReservedResource());
         }
       }
     } finally {
@@ -560,6 +672,7 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
     if (!reReservation) {
       getCSLeafQueue().apply(cluster, request);
     }
+    return true;
   }
 
   public boolean unreserve(SchedulerRequestKey schedulerKey,
@@ -626,8 +739,8 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
       Map<String, Resource> ret = new HashMap<>();
       for (SchedulerRequestKey schedulerKey : appSchedulingInfo
           .getSchedulerKeys()) {
-        SchedulingPlacementSet<FiCaSchedulerNode> ps =
-            appSchedulingInfo.getSchedulingPlacementSet(schedulerKey);
+        AppPlacementAllocator<FiCaSchedulerNode> ps =
+            appSchedulingInfo.getAppPlacementAllocator(schedulerKey);
 
         String nodePartition = ps.getPrimaryRequestedNodePartition();
         Resource res = ret.get(nodePartition);
@@ -690,6 +803,8 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
       ResourceRequest rr = ResourceRequest.newBuilder()
           .priority(Priority.UNDEFINED).resourceName(ResourceRequest.ANY)
           .capability(minimumAllocation).numContainers(numCont).build();
+      List<Container> previousAttemptContainers =
+          pullPreviousAttemptContainers();
       List<Container> newlyAllocatedContainers = pullNewlyAllocatedContainers();
       List<Container> newlyIncreasedContainers = pullNewlyIncreasedContainers();
       List<Container> newlyDecreasedContainers = pullNewlyDecreasedContainers();
@@ -701,16 +816,16 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
       return new Allocation(newlyAllocatedContainers, headroom, null,
           currentContPreemption, Collections.singletonList(rr), updatedNMTokens,
           newlyIncreasedContainers, newlyDecreasedContainers,
-          newlyPromotedContainers, newlyDemotedContainers);
+          newlyPromotedContainers, newlyDemotedContainers,
+          previousAttemptContainers);
     } finally {
       writeLock.unlock();
     }
   }
 
   @VisibleForTesting
-  public NodeId getNodeIdToUnreserve(
-      SchedulerRequestKey schedulerKey, Resource resourceNeedUnreserve,
-      ResourceCalculator rc, Resource clusterResource) {
+  public NodeId getNodeIdToUnreserve(SchedulerRequestKey schedulerKey,
+      Resource resourceNeedUnreserve, ResourceCalculator resourceCalculator) {
     // first go around make this algorithm simple and just grab first
     // reservation that has enough resources
     Map<NodeId, RMContainer> reservedContainers = this.reservedContainers.get(
@@ -725,7 +840,7 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
 
         // make sure we unreserve one with at least the same amount of
         // resources, otherwise could affect capacity limits
-        if (Resources.fitsIn(rc, clusterResource, resourceNeedUnreserve,
+        if (Resources.fitsIn(resourceCalculator, resourceNeedUnreserve,
             reservedResource)) {
           if (LOG.isDebugEnabled()) {
             LOG.debug(
@@ -793,14 +908,13 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
   }
 
   @VisibleForTesting
-  public RMContainer findNodeToUnreserve(Resource clusterResource,
-      FiCaSchedulerNode node, SchedulerRequestKey schedulerKey,
-      Resource minimumUnreservedResource) {
+  public RMContainer findNodeToUnreserve(FiCaSchedulerNode node,
+      SchedulerRequestKey schedulerKey, Resource minimumUnreservedResource) {
     try {
       readLock.lock();
       // need to unreserve some other container first
       NodeId idToUnreserve = getNodeIdToUnreserve(schedulerKey,
-          minimumUnreservedResource, rc, clusterResource);
+          minimumUnreservedResource, rc);
       if (idToUnreserve == null) {
         if (LOG.isDebugEnabled()) {
           LOG.debug("checked to see if could unreserve for app but nothing "
@@ -836,8 +950,9 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
   }
 
   public CSAssignment assignContainers(Resource clusterResource,
-      PlacementSet<FiCaSchedulerNode> ps, ResourceLimits currentResourceLimits,
-      SchedulingMode schedulingMode, RMContainer reservedContainer) {
+      CandidateNodeSet<FiCaSchedulerNode> ps,
+      ResourceLimits currentResourceLimits, SchedulingMode schedulingMode,
+      RMContainer reservedContainer) {
     if (LOG.isDebugEnabled()) {
       LOG.debug("pre-assignContainers for application "
           + getApplicationId());
@@ -894,6 +1009,7 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
       StringBuilder diagnosticMessage) {
     LeafQueue queue = getCSLeafQueue();
     QueueCapacities queueCapacities = queue.getQueueCapacities();
+    QueueResourceQuotas queueResourceQuotas = queue.getQueueResourceQuotas();
     diagnosticMessage.append(" Details : AM Partition = ");
     diagnosticMessage.append(appAMNodePartitionName.isEmpty()
         ? NodeLabel.DEFAULT_NODE_LABEL_PARTITION : appAMNodePartitionName);
@@ -915,6 +1031,18 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
         queueCapacities.getAbsoluteMaximumCapacity(appAMNodePartitionName)
             * 100);
     diagnosticMessage.append(" % ; ");
+    diagnosticMessage.append("Queue's capacity (absolute resource) = ");
+    diagnosticMessage.append(
+        queueResourceQuotas.getEffectiveMinResource(appAMNodePartitionName));
+    diagnosticMessage.append(" ; ");
+    diagnosticMessage.append("Queue's used capacity (absolute resource) = ");
+    diagnosticMessage
+        .append(queue.getQueueResourceUsage().getUsed(appAMNodePartitionName));
+    diagnosticMessage.append(" ; ");
+    diagnosticMessage.append("Queue's max capacity (absolute resource) = ");
+    diagnosticMessage.append(
+        queueResourceQuotas.getEffectiveMaxResource(appAMNodePartitionName));
+    diagnosticMessage.append(" ; ");
   }
 
   /**
@@ -954,9 +1082,9 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
 
   @Override
   @SuppressWarnings("unchecked")
-  public SchedulingPlacementSet<FiCaSchedulerNode> getSchedulingPlacementSet(
+  public AppPlacementAllocator<FiCaSchedulerNode> getAppPlacementAllocator(
       SchedulerRequestKey schedulerRequestKey) {
-    return super.getSchedulingPlacementSet(schedulerRequestKey);
+    return super.getAppPlacementAllocator(schedulerRequestKey);
   }
 
   /**
@@ -977,14 +1105,14 @@ public class FiCaSchedulerApp extends SchedulerApplicationAttempt {
               getAppAMNodePartitionName(), cluster);
       ResourceCalculator calc =
           rmContext.getScheduler().getResourceCalculator();
+      float queueUsagePerc = 0.0f;
       if (!calc.isInvalidDivisor(totalPartitionRes)) {
-        float queueAbsMaxCapPerPartition =
-            ((AbstractCSQueue) getQueue()).getQueueCapacities()
-                .getAbsoluteCapacity(getAppAMNodePartitionName());
-        float queueUsagePerc = calc.divide(totalPartitionRes,
-            report.getUsedResources(),
-            Resources.multiply(totalPartitionRes, queueAbsMaxCapPerPartition))
-            * 100;
+        Resource effCap = ((AbstractCSQueue) getQueue())
+            .getEffectiveCapacity(getAppAMNodePartitionName());
+        if (!effCap.equals(Resources.none())) {
+          queueUsagePerc = calc.divide(totalPartitionRes,
+              report.getUsedResources(), effCap) * 100;
+        }
         report.setQueueUsagePercentage(queueUsagePerc);
       }
       return report;

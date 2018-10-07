@@ -18,24 +18,14 @@
 
 package org.apache.hadoop.tools.util;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertFalse;
-
-import java.io.IOException;
-import java.io.OutputStream;
-import java.util.EnumSet;
-import java.util.Random;
-import java.util.Stack;
-
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.contract.ContractTestUtils;
 import org.apache.hadoop.fs.permission.FsPermission;
-import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.MiniDFSCluster;
 import org.apache.hadoop.hdfs.server.namenode.INodeFile;
 import org.apache.hadoop.hdfs.tools.ECAdmin;
@@ -49,8 +39,18 @@ import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import java.io.IOException;
+import java.io.OutputStream;
+import java.util.EnumSet;
+import java.util.Random;
+import java.util.Stack;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
 public class TestDistCpUtils {
-  private static final Log LOG = LogFactory.getLog(TestDistCpUtils.class);
+  private static final Logger LOG = LoggerFactory.getLogger(TestDistCpUtils.class);
 
   private static final Configuration config = new Configuration();
   private static MiniDFSCluster cluster;
@@ -60,12 +60,11 @@ public class TestDistCpUtils {
   
   @BeforeClass
   public static void create() throws IOException {
-    config.set(DFSConfigKeys.DFS_NAMENODE_EC_POLICIES_ENABLED_KEY,
-        "XOR-2-1-64k");
     cluster = new MiniDFSCluster.Builder(config)
         .numDataNodes(2)
         .format(true)
-        .build(); 
+        .build();
+    cluster.getFileSystem().enableErasureCodingPolicy("XOR-2-1-1024k");
   }
 
   @AfterClass
@@ -562,7 +561,7 @@ public class TestDistCpUtils {
     fs.mkdirs(srcECDir);
     fs.mkdirs(dstReplDir);
     String[] args = {"-setPolicy", "-path", "/tmp/srcECDir",
-        "-policy", "XOR-2-1-64k"};
+        "-policy", "XOR-2-1-1024k"};
     int res = ToolRunner.run(config, new ECAdmin(config), args);
     assertEquals("Setting EC policy should succeed!", 0, res);
     verifyReplFactorNotPreservedOnErasureCodedFile(srcECFile, true,
@@ -577,7 +576,7 @@ public class TestDistCpUtils {
     fs.mkdirs(srcReplDir);
     fs.mkdirs(dstECDir);
     args = new String[]{"-setPolicy", "-path", "/tmp/dstECDir",
-        "-policy", "XOR-2-1-64k"};
+        "-policy", "XOR-2-1-1024k"};
     res = ToolRunner.run(config, new ECAdmin(config), args);
     assertEquals("Setting EC policy should succeed!", 0, res);
     verifyReplFactorNotPreservedOnErasureCodedFile(srcReplFile,
@@ -1189,26 +1188,33 @@ public class TestDistCpUtils {
     }
   }
 
-  public static boolean checkIfFoldersAreInSync(FileSystem fs, String targetBase, String sourceBase)
-      throws IOException {
+  public static void verifyFoldersAreInSync(FileSystem fs, String targetBase,
+      String sourceBase) throws IOException {
     Path base = new Path(targetBase);
 
-     Stack<Path> stack = new Stack<Path>();
-     stack.push(base);
-     while (!stack.isEmpty()) {
-       Path file = stack.pop();
-       if (!fs.exists(file)) continue;
-       FileStatus[] fStatus = fs.listStatus(file);
-       if (fStatus == null || fStatus.length == 0) continue;
+    Stack<Path> stack = new Stack<>();
+    stack.push(base);
+    while (!stack.isEmpty()) {
+      Path file = stack.pop();
+      if (!fs.exists(file)) {
+        continue;
+      }
+      FileStatus[] fStatus = fs.listStatus(file);
+      if (fStatus == null || fStatus.length == 0) {
+        continue;
+      }
 
-       for (FileStatus status : fStatus) {
-         if (status.isDirectory()) {
-           stack.push(status.getPath());
-         }
-         Assert.assertTrue(fs.exists(new Path(sourceBase + "/" +
-             DistCpUtils.getRelativePath(new Path(targetBase), status.getPath()))));
-       }
-     }
-     return true;
+      for (FileStatus status : fStatus) {
+        if (status.isDirectory()) {
+          stack.push(status.getPath());
+        }
+        Path p = new Path(sourceBase + "/" +
+            DistCpUtils.getRelativePath(new Path(targetBase),
+                status.getPath()));
+        ContractTestUtils.assertPathExists(fs,
+            "path in sync with " + status.getPath(), p);
+      }
+    }
   }
+
 }

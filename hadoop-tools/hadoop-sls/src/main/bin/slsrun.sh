@@ -77,9 +77,13 @@ function parse_args()
 function calculate_classpath
 {
   hadoop_add_to_classpath_tools hadoop-sls
+
+  hadoop_add_classpath "${HADOOP_YARN_HOME}/${YARN_DIR}/timelineservice"'/*'
 }
 
 function run_simulation() {
+
+  local args
 
    if [[ "${inputsls}" != "" ]] ; then
         hadoop_add_param args -inputsls "-inputsls ${inputsls}"
@@ -126,6 +130,7 @@ HADOOP_LIBEXEC_DIR="${HADOOP_LIBEXEC_DIR:-$HADOOP_DEFAULT_LIBEXEC_DIR}"
 # shellcheck disable=SC2034
 HADOOP_NEW_CONFIG=true
 if [[ -f "${HADOOP_LIBEXEC_DIR}/hadoop-config.sh" ]]; then
+  # shellcheck disable=SC1090
   . "${HADOOP_LIBEXEC_DIR}/hadoop-config.sh"
 else
   echo "ERROR: Cannot execute ${HADOOP_LIBEXEC_DIR}/hadoop-config.sh." 2>&1

@@ -19,12 +19,16 @@ package org.apache.hadoop.hdfs.tools;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
-import org.apache.hadoop.hdfs.protocol.AddECPolicyResponse;
+import org.apache.hadoop.hdfs.protocol.AddErasureCodingPolicyResponse;
 import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicy;
+import org.apache.hadoop.hdfs.protocol.ErasureCodingPolicyInfo;
+import org.apache.hadoop.hdfs.protocol.NoECPolicySetException;
 import org.apache.hadoop.hdfs.util.ECPolicyLoader;
+import org.apache.hadoop.io.erasurecode.ErasureCodeConstants;
 import org.apache.hadoop.tools.TableListing;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Tool;
@@ -33,7 +37,6 @@ import org.apache.hadoop.util.ToolRunner;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -100,9 +103,7 @@ public class ECAdmin extends Configured implements Tool {
     @Override
     public String getLongUsage() {
       return getShortUsage() + "\n" +
-          "Get the list of enabled erasure coding policies.\n" +
-          "Policies can be enabled on the NameNode via `" +
-          DFSConfigKeys.DFS_NAMENODE_EC_POLICIES_ENABLED_KEY + "`.\n";
+          "Get the list of all erasure coding policies.\n";
     }
 
     @Override
@@ -114,20 +115,16 @@ public class ECAdmin extends Configured implements Tool {
 
       final DistributedFileSystem dfs = AdminHelper.getDFS(conf);
       try {
-        Collection<ErasureCodingPolicy> policies =
+        final Collection<ErasureCodingPolicyInfo> policies =
             dfs.getAllErasureCodingPolicies();
         if (policies.isEmpty()) {
-          System.out.println("No erasure coding policies are enabled on the " +
+          System.out.println("There is no erasure coding policies in the " +
               "cluster.");
-          System.out.println("The set of enabled policies can be " +
-              "configured at '" +
-              DFSConfigKeys.DFS_NAMENODE_EC_POLICIES_ENABLED_KEY + "' on the " +
-              "NameNode.");
         } else {
           System.out.println("Erasure Coding Policies:");
-          for (ErasureCodingPolicy policy : policies) {
+          for (ErasureCodingPolicyInfo policy : policies) {
             if (policy != null) {
-              System.out.println("\t" + policy.getName());
+              System.out.println(policy);
             }
           }
         }
@@ -158,7 +155,7 @@ public class ECAdmin extends Configured implements Tool {
       listing.addRow("<file>",
           "The path of the xml file which defines the EC policies to add");
       return getShortUsage() + "\n" +
-          "Add a list of erasure coding policies.\n" +
+          "Add a list of user defined erasure coding policies.\n" +
           listing.toString();
     }
 
@@ -182,9 +179,10 @@ public class ECAdmin extends Configured implements Tool {
         List<ErasureCodingPolicy> policies =
             new ECPolicyLoader().loadPolicy(filePath);
         if (policies.size() > 0) {
-          AddECPolicyResponse[] responses = dfs.addErasureCodingPolicies(
+          AddErasureCodingPolicyResponse[] responses =
+              dfs.addErasureCodingPolicies(
             policies.toArray(new ErasureCodingPolicy[policies.size()]));
-          for (AddECPolicyResponse response : responses) {
+          for (AddErasureCodingPolicyResponse response : responses) {
             System.out.println(response);
           }
         } else {
@@ -271,7 +269,7 @@ public class ECAdmin extends Configured implements Tool {
       TableListing listing = AdminHelper.getOptionDescriptionListing();
       listing.addRow("<policy>", "The name of the erasure coding policy");
       return getShortUsage() + "\n" +
-          "Remove an erasure coding policy.\n" +
+          "Remove an user defined erasure coding policy.\n" +
           listing.toString();
     }
 
@@ -310,7 +308,8 @@ public class ECAdmin extends Configured implements Tool {
 
     @Override
     public String getShortUsage() {
-      return "[" + getName() + " -path <path> -policy <policy>]\n";
+      return "[" + getName() +
+          " -path <path> [-policy <policy>] [-replicate]]\n";
     }
 
     @Override
@@ -319,9 +318,13 @@ public class ECAdmin extends Configured implements Tool {
       listing.addRow("<path>", "The path of the file/directory to set " +
           "the erasure coding policy");
       listing.addRow("<policy>", "The name of the erasure coding policy");
+      listing.addRow("-replicate",
+          "force 3x replication scheme on the directory");
       return getShortUsage() + "\n" +
           "Set the erasure coding policy for a file/directory.\n\n" +
-          listing.toString();
+          listing.toString() + "\n" +
+          "-replicate and -policy are optional arguments. They cannot been " +
+          "used at the same time";
     }
 
     @Override
@@ -333,28 +336,42 @@ public class ECAdmin extends Configured implements Tool {
         return 1;
       }
 
-      final String ecPolicyName = StringUtils.popOptionWithArgument("-policy",
+      String ecPolicyName = StringUtils.popOptionWithArgument("-policy",
           args);
-      if (ecPolicyName == null) {
-        System.err.println("Please specify the policy name.\nUsage: " +
-            getLongUsage());
-        return 1;
-      }
+      final boolean replicate = StringUtils.popOption("-replicate", args);
 
       if (args.size() > 0) {
         System.err.println(getName() + ": Too many arguments");
         return 1;
       }
 
+      if (replicate) {
+        if (ecPolicyName != null) {
+          System.err.println(getName() +
+              ": -replicate and -policy cannot been used at the same time");
+          return 2;
+        }
+        ecPolicyName = ErasureCodeConstants.REPLICATION_POLICY_NAME;
+      }
+
       final Path p = new Path(path);
       final DistributedFileSystem dfs = AdminHelper.getDFS(p.toUri(), conf);
       try {
         dfs.setErasureCodingPolicy(p, ecPolicyName);
-        System.out.println("Set erasure coding policy " + ecPolicyName +
-            " on " + path);
+
+        String actualECPolicyName = dfs.getErasureCodingPolicy(p).getName();
+
+        System.out.println("Set " + actualECPolicyName +
+            " erasure coding policy on "+ path);
+        RemoteIterator<FileStatus> dirIt = dfs.listStatusIterator(p);
+        if (dirIt.hasNext()) {
+          System.out.println("Warning: setting erasure coding policy on a " +
+              "non-empty directory will not automatically convert existing " +
+              "files to " + actualECPolicyName + " erasure coding policy");
+        }
       } catch (Exception e) {
         System.err.println(AdminHelper.prettifyException(e));
-        return 2;
+        return 3;
       }
       return 0;
     }
@@ -402,6 +419,18 @@ public class ECAdmin extends Configured implements Tool {
       try {
         dfs.unsetErasureCodingPolicy(p);
         System.out.println("Unset erasure coding policy from " + path);
+        RemoteIterator<FileStatus> dirIt = dfs.listStatusIterator(p);
+        if (dirIt.hasNext()) {
+          System.out.println("Warning: unsetting erasure coding policy on a " +
+              "non-empty directory will not automatically convert existing" +
+              " files to replicated data.");
+        }
+      } catch (NoECPolicySetException e) {
+        System.err.println(AdminHelper.prettifyException(e));
+        System.err.println("Use '-setPolicy -path <PATH> -replicate' to enforce"
+            + " default replication policy irrespective of EC policy"
+            + " defined on parent.");
+        return 2;
       } catch (Exception e) {
         System.err.println(AdminHelper.prettifyException(e));
         return 2;
@@ -441,7 +470,7 @@ public class ECAdmin extends Configured implements Tool {
 
       final DistributedFileSystem dfs = AdminHelper.getDFS(conf);
       try {
-        HashMap<String, String> codecs =
+        Map<String, String> codecs =
             dfs.getAllErasureCodingCodecs();
         if (codecs.isEmpty()) {
           System.out.println("No erasure coding codecs are supported on the " +

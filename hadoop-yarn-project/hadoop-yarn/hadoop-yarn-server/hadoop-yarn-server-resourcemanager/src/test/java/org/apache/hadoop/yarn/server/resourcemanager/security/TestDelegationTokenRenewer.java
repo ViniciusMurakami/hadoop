@@ -20,6 +20,7 @@ package org.apache.hadoop.yarn.server.resourcemanager.security;
 
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.fail;
 import static org.mockito.Matchers.any;
 import static org.mockito.Mockito.doAnswer;
@@ -1006,9 +1007,8 @@ public class TestDelegationTokenRenewer {
     Credentials credentials = new Credentials();
     credentials.addToken(userText1, originalToken);
 
-    MemoryRMStateStore memStore = new MemoryRMStateStore();
-    memStore.init(yarnConf);
-    MockRM rm1 = new TestSecurityMockRM(yarnConf, memStore);
+    MockRM rm1 = new TestSecurityMockRM(yarnConf);
+    MemoryRMStateStore memStore = (MemoryRMStateStore) rm1.getRMStateStore();
     rm1.start();
     RMApp app = rm1.submitApp(200, "name", "user",
         new HashMap<ApplicationAccessType, String>(), false, "default", 1,
@@ -1263,9 +1263,27 @@ public class TestDelegationTokenRenewer {
     Assert.assertFalse(Renewer.cancelled);
 
     finishAMAndWaitForComplete(app3, rm, nm1, am3, dttr);
+    GenericTestUtils.waitFor(new Supplier<Boolean>() {
+      @Override
+      public Boolean get() {
+        return !renewer.getAllTokens().containsKey(token1);
+      }
+    }, 10, 5000);
     Assert.assertFalse(renewer.getAllTokens().containsKey(token1));
     Assert.assertTrue(dttr.referringAppIds.isEmpty());
+    GenericTestUtils.waitFor(new Supplier<Boolean>() {
+      @Override
+      public Boolean get() {
+        return dttr.isTimerCancelled();
+      }
+    }, 10, 5000);
     Assert.assertTrue(dttr.isTimerCancelled());
+    GenericTestUtils.waitFor(new Supplier<Boolean>() {
+      @Override
+      public Boolean get() {
+        return Renewer.cancelled;
+      }
+    }, 10, 5000);
     Assert.assertTrue(Renewer.cancelled);
 
     // make sure the token also has been removed from appTokens
@@ -1383,5 +1401,47 @@ public class TestDelegationTokenRenewer {
       Assert.assertTrue(e.getCause().getMessage()
           .contains(YarnConfiguration.RM_DELEGATION_TOKEN_MAX_CONF_SIZE));
     }
+  }
+
+  // Test if the token renewer returned an invalid expiration time, that token's
+  // renewal should be ignored.
+  @Test
+  public void testTokenRenewerInvalidReturn() throws Exception {
+    DelegationTokenToRenew mockDttr = mock(DelegationTokenToRenew.class);
+    mockDttr.expirationDate = 0;
+    delegationTokenRenewer.setTimerForTokenRenewal(mockDttr);
+    assertNull(mockDttr.timerTask);
+
+    mockDttr.expirationDate = -1;
+    delegationTokenRenewer.setTimerForTokenRenewal(mockDttr);
+    assertNull(mockDttr.timerTask);
+
+    mockDttr.expirationDate = System.currentTimeMillis() - 1;
+    delegationTokenRenewer.setTimerForTokenRenewal(mockDttr);
+    assertNull(mockDttr.timerTask);
+  }
+
+  /**
+   * Test that the DelegationTokenRenewer class can gracefully handle
+   * interactions that occur when it has been stopped.
+   */
+  @Test
+  public void testShutDown() {
+    DelegationTokenRenewer dtr = createNewDelegationTokenRenewer(conf, counter);
+    RMContext mockContext = mock(RMContext.class);
+    when(mockContext.getSystemCredentialsForApps()).thenReturn(
+        new ConcurrentHashMap<ApplicationId, ByteBuffer>());
+    ClientRMService mockClientRMService = mock(ClientRMService.class);
+    when(mockContext.getClientRMService()).thenReturn(mockClientRMService);
+    InetSocketAddress sockAddr =
+        InetSocketAddress.createUnresolved("localhost", 1234);
+    when(mockClientRMService.getBindAddress()).thenReturn(sockAddr);
+    dtr.setRMContext(mockContext);
+    when(mockContext.getDelegationTokenRenewer()).thenReturn(dtr);
+    dtr.init(conf);
+    dtr.start();
+    delegationTokenRenewer.stop();
+    delegationTokenRenewer.applicationFinished(
+        BuilderUtils.newApplicationId(0, 1));
   }
 }

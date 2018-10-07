@@ -40,10 +40,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
 import org.apache.commons.io.IOUtils;
-import org.apache.commons.lang.RandomStringUtils;
+import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.impl.Log4JLogger;
 import org.apache.hadoop.fs.FileUtil;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
 import org.apache.log4j.Appender;
@@ -248,7 +249,7 @@ public abstract class GenericTestUtils {
    * @return the absolute directory for tests. Caller is expected to create it.
    */
   public static File getRandomizedTestDir() {
-    return new File(getRandomizedTempPath()).getAbsoluteFile();
+    return new File(getRandomizedTempPath());
   }
 
   /**
@@ -259,7 +260,9 @@ public abstract class GenericTestUtils {
    * @return a string to use in paths
    */
   public static String getTempPath(String subpath) {
-    String prop = System.getProperty(SYSPROP_TEST_DATA_DIR, DEFAULT_TEST_DATA_PATH);
+    String prop = (Path.WINDOWS) ? DEFAULT_TEST_DATA_PATH
+        : System.getProperty(SYSPROP_TEST_DATA_DIR, DEFAULT_TEST_DATA_PATH);
+
     if (prop.isEmpty()) {
       // corner case: property is there but empty
       prop = DEFAULT_TEST_DATA_PATH;
@@ -274,7 +277,6 @@ public abstract class GenericTestUtils {
    * Get a temp path. This may or may not be relative; it depends on what the
    * {@link #SYSPROP_TEST_DATA_DIR} is set to. If unset, it returns a path
    * under the relative path {@link #DEFAULT_TEST_DATA_PATH}
-   * @param subpath sub path, with no leading "/" character
    * @return a string to use in paths
    */
   public static String getRandomizedTempPath() {
@@ -287,7 +289,7 @@ public abstract class GenericTestUtils {
   public static void assertExists(File f) {
     Assert.assertTrue("File " + f + " should exist", f.exists());
   }
-    
+
   /**
    * List all of the files in 'dir' that match the regex 'pattern'.
    * Then check that this list is identical to 'expectedMatches'.
@@ -295,7 +297,7 @@ public abstract class GenericTestUtils {
    */
   public static void assertGlobEquals(File dir, String pattern,
       String ... expectedMatches) throws IOException {
-    
+
     Set<String> found = Sets.newTreeSet();
     for (File f : FileUtil.listFiles(dir)) {
       if (f.getName().matches(pattern)) {
@@ -317,43 +319,75 @@ public abstract class GenericTestUtils {
   /**
    * Assert that an exception's <code>toString()</code> value
    * contained the expected text.
-   * @param string expected string
+   * @param expectedText expected string
    * @param t thrown exception
    * @throws AssertionError if the expected string is not found
    */
-  public static void assertExceptionContains(String string, Throwable t) {
+  public static void assertExceptionContains(String expectedText, Throwable t) {
+    assertExceptionContains(expectedText, t, "");
+  }
+
+  /**
+   * Assert that an exception's <code>toString()</code> value
+   * contained the expected text.
+   * @param expectedText expected string
+   * @param t thrown exception
+   * @param message any extra text for the string
+   * @throws AssertionError if the expected string is not found
+   */
+  public static void assertExceptionContains(String expectedText,
+      Throwable t,
+      String message) {
     Assert.assertNotNull(E_NULL_THROWABLE, t);
     String msg = t.toString();
     if (msg == null) {
       throw new AssertionError(E_NULL_THROWABLE_STRING, t);
     }
-    if (!msg.contains(string)) {
-      throw new AssertionError("Expected to find '" + string + "' "
-          + E_UNEXPECTED_EXCEPTION + ":"
-          + StringUtils.stringifyException(t),
+    if (expectedText != null && !msg.contains(expectedText)) {
+      String prefix = org.apache.commons.lang3.StringUtils.isEmpty(message)
+          ? "" : (message + ": ");
+      throw new AssertionError(
+          String.format("%s Expected to find '%s' %s: %s",
+              prefix, expectedText, E_UNEXPECTED_EXCEPTION,
+              StringUtils.stringifyException(t)),
           t);
     }
-  }  
+  }
 
+  /**
+   * Wait for the specified test to return true. The test will be performed
+   * initially and then every {@code checkEveryMillis} until at least
+   * {@code waitForMillis} time has expired. If {@code check} is null or
+   * {@code waitForMillis} is less than {@code checkEveryMillis} this method
+   * will throw an {@link IllegalArgumentException}.
+   *
+   * @param check the test to perform
+   * @param checkEveryMillis how often to perform the test
+   * @param waitForMillis the amount of time after which no more tests will be
+   * performed
+   * @throws TimeoutException if the test does not return true in the allotted
+   * time
+   * @throws InterruptedException if the method is interrupted while waiting
+   */
   public static void waitFor(Supplier<Boolean> check, int checkEveryMillis,
       int waitForMillis) throws TimeoutException, InterruptedException {
     Preconditions.checkNotNull(check, ERROR_MISSING_ARGUMENT);
-    Preconditions.checkArgument(waitForMillis > checkEveryMillis,
+    Preconditions.checkArgument(waitForMillis >= checkEveryMillis,
         ERROR_INVALID_ARGUMENT);
 
-    long st = Time.now();
-    do {
-      boolean result = check.get();
-      if (result) {
-        return;
-      }
-      
+    long st = Time.monotonicNow();
+    boolean result = check.get();
+
+    while (!result && (Time.monotonicNow() - st < waitForMillis)) {
       Thread.sleep(checkEveryMillis);
-    } while (Time.now() - st < waitForMillis);
-    
-    throw new TimeoutException("Timed out waiting for condition. " +
-        "Thread diagnostics:\n" +
-        TimedOutTestsListener.buildThreadDiagnosticString());
+      result = check.get();
+    }
+
+    if (!result) {
+      throw new TimeoutException("Timed out waiting for condition. " +
+          "Thread diagnostics:\n" +
+          TimedOutTestsListener.buildThreadDiagnosticString());
+    }
   }
 
   /**
@@ -467,20 +501,20 @@ public abstract class GenericTestUtils {
    * method is called, then waits on another before continuing.
    */
   public static class DelayAnswer implements Answer<Object> {
-    private final Log LOG;
-    
+    private final org.slf4j.Logger LOG;
+
     private final CountDownLatch fireLatch = new CountDownLatch(1);
     private final CountDownLatch waitLatch = new CountDownLatch(1);
     private final CountDownLatch resultLatch = new CountDownLatch(1);
-    
+
     private final AtomicInteger fireCounter = new AtomicInteger(0);
     private final AtomicInteger resultCounter = new AtomicInteger(0);
-    
+
     // Result fields set after proceed() is called.
     private volatile Throwable thrown;
     private volatile Object returnValue;
-    
-    public DelayAnswer(Log log) {
+
+    public DelayAnswer(org.slf4j.Logger log) {
       this.LOG = log;
     }
 
@@ -490,7 +524,7 @@ public abstract class GenericTestUtils {
     public void waitForCall() throws InterruptedException {
       fireLatch.await();
     }
-  
+
     /**
      * Tell the method to proceed.
      * This should only be called after waitForCall()
@@ -498,7 +532,7 @@ public abstract class GenericTestUtils {
     public void proceed() {
       waitLatch.countDown();
     }
-  
+
     @Override
     public Object answer(InvocationOnMock invocation) throws Throwable {
       LOG.info("DelayAnswer firing fireLatch");
@@ -527,7 +561,7 @@ public abstract class GenericTestUtils {
         resultLatch.countDown();
       }
     }
-    
+
     /**
      * After calling proceed(), this will wait until the call has
      * completed and a result has been returned to the caller.
@@ -535,7 +569,7 @@ public abstract class GenericTestUtils {
     public void waitForResult() throws InterruptedException {
       resultLatch.await();
     }
-    
+
     /**
      * After the call has gone through, return any exception that
      * was thrown, or null if no exception was thrown.
@@ -543,7 +577,7 @@ public abstract class GenericTestUtils {
     public Throwable getThrown() {
       return thrown;
     }
-    
+
     /**
      * After the call has gone through, return the call's return value,
      * or null in case it was void or an exception was thrown.
@@ -551,20 +585,20 @@ public abstract class GenericTestUtils {
     public Object getReturnValue() {
       return returnValue;
     }
-    
+
     public int getFireCount() {
       return fireCounter.get();
     }
-    
+
     public int getResultCount() {
       return resultCounter.get();
     }
   }
-  
+
   /**
    * An Answer implementation that simply forwards all calls through
    * to a delegate.
-   * 
+   *
    * This is useful as the default Answer for a mock object, to create
    * something like a spy on an RPC proxy. For example:
    * <code>
@@ -575,15 +609,15 @@ public abstract class GenericTestUtils {
    *    ...
    * </code>
    */
-  public static class DelegateAnswer implements Answer<Object> { 
+  public static class DelegateAnswer implements Answer<Object> {
     private final Object delegate;
-    private final Log log;
-    
+    private final org.slf4j.Logger log;
+
     public DelegateAnswer(Object delegate) {
       this(null, delegate);
     }
-    
-    public DelegateAnswer(Log log, Object delegate) {
+
+    public DelegateAnswer(org.slf4j.Logger log, Object delegate) {
       this.log = log;
       this.delegate = delegate;
     }
@@ -610,18 +644,24 @@ public abstract class GenericTestUtils {
    * conditions.
    */
   public static class SleepAnswer implements Answer<Object> {
+    private final int minSleepTime;
     private final int maxSleepTime;
     private static Random r = new Random();
-    
+
     public SleepAnswer(int maxSleepTime) {
+      this(0, maxSleepTime);
+    }
+
+    public SleepAnswer(int minSleepTime, int maxSleepTime) {
+      this.minSleepTime = minSleepTime;
       this.maxSleepTime = maxSleepTime;
     }
-    
+
     @Override
     public Object answer(InvocationOnMock invocation) throws Throwable {
       boolean interrupted = false;
       try {
-        Thread.sleep(r.nextInt(maxSleepTime));
+        Thread.sleep(r.nextInt(maxSleepTime - minSleepTime) + minSleepTime);
       } catch (InterruptedException ie) {
         interrupted = true;
       }
@@ -646,11 +686,11 @@ public abstract class GenericTestUtils {
         " but got:\n" + output,
         Pattern.compile(pattern).matcher(output).find());
   }
-  
+
   public static void assertValueNear(long expected, long actual, long allowedError) {
     assertValueWithinRange(expected - allowedError, expected + allowedError, actual);
   }
-  
+
   public static void assertValueWithinRange(long expectedMin, long expectedMax,
       long actual) {
     Assert.assertTrue("Expected " + actual + " to be in range (" + expectedMin + ","
@@ -805,4 +845,28 @@ public abstract class GenericTestUtils {
       failf(format, args);
     }
   }
+
+  /**
+   * Retreive the max number of parallel test threads when running under maven.
+   * @return int number of threads
+   */
+  public static int getTestsThreadCount() {
+    String propString = System.getProperty("testsThreadCount", "1");
+    int threadCount = 1;
+    if (propString != null) {
+      String trimProp = propString.trim();
+      if (trimProp.endsWith("C")) {
+        double multiplier = Double.parseDouble(
+            trimProp.substring(0, trimProp.length()-1));
+        double calculated = multiplier * ((double) Runtime
+            .getRuntime()
+            .availableProcessors());
+        threadCount = calculated > 0d ? Math.max((int) calculated, 1) : 0;
+      } else {
+        threadCount = Integer.parseInt(trimProp);
+      }
+    }
+    return threadCount;
+  }
+
 }

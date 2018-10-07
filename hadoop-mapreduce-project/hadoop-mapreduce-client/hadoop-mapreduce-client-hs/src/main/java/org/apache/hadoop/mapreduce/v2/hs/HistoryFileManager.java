@@ -40,8 +40,6 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
@@ -76,6 +74,8 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.hadoop.yarn.util.Clock;
 import org.apache.hadoop.yarn.util.SystemClock;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * This class provides a way to interact with history files in a thread safe
@@ -84,8 +84,10 @@ import org.apache.hadoop.yarn.util.SystemClock;
 @InterfaceAudience.Public
 @InterfaceStability.Unstable
 public class HistoryFileManager extends AbstractService {
-  private static final Log LOG = LogFactory.getLog(HistoryFileManager.class);
-  private static final Log SUMMARY_LOG = LogFactory.getLog(JobSummary.class);
+  private static final Logger LOG =
+      LoggerFactory.getLogger(HistoryFileManager.class);
+  private static final Logger SUMMARY_LOG =
+      LoggerFactory.getLogger(JobSummary.class);
 
   private enum HistoryInfoState {
     IN_INTERMEDIATE, IN_DONE, DELETED, MOVE_FAILED
@@ -322,7 +324,13 @@ public class HistoryFileManager extends AbstractService {
       // so we need to have additional check.
       // Note: modTime (X second Y millisecond) could be casted to X second or
       // X+1 second.
-      if (modTime != newModTime
+      // MAPREDUCE-7101: Some Cloud FileSystems do not currently update the
+      // modification time of directories. For these, we scan every time if
+      // the 'alwaysScan' is true.
+      boolean alwaysScan = conf.getBoolean(
+          JHAdminConfig.MR_HISTORY_ALWAYS_SCAN_USER_DIR,
+          JHAdminConfig.DEFAULT_MR_HISTORY_ALWAYS_SCAN_USER_DIR);
+      if (alwaysScan || modTime != newModTime
           || (scanTime/1000) == (modTime/1000)
           || (scanTime/1000 + 1) == (modTime/1000)) {
         // reset scanTime before scanning happens
@@ -450,6 +458,8 @@ public class HistoryFileManager extends AbstractService {
       } catch (Throwable t) {
         LOG.error("Error while trying to move a job to done", t);
         this.state = HistoryInfoState.MOVE_FAILED;
+      } finally {
+        notifyAll();
       }
     }
 
@@ -483,12 +493,16 @@ public class HistoryFileManager extends AbstractService {
     }
     
     protected synchronized void delete() throws IOException {
-      if (LOG.isDebugEnabled()) {
-        LOG.debug("deleting " + historyFile + " and " + confFile);
+      try {
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("deleting " + historyFile + " and " + confFile);
+        }
+        state = HistoryInfoState.DELETED;
+        doneDirFc.delete(doneDirFc.makeQualified(historyFile), false);
+        doneDirFc.delete(doneDirFc.makeQualified(confFile), false);
+      } finally {
+        notifyAll();
       }
-      state = HistoryInfoState.DELETED;
-      doneDirFc.delete(doneDirFc.makeQualified(historyFile), false);
-      doneDirFc.delete(doneDirFc.makeQualified(confFile), false);
     }
 
     public JobIndexInfo getJobIndexInfo() {
@@ -506,7 +520,7 @@ public class HistoryFileManager extends AbstractService {
     public synchronized Configuration loadConfFile() throws IOException {
       FileContext fc = FileContext.getFileContext(confFile.toUri(), conf);
       Configuration jobConf = new Configuration(false);
-      jobConf.addResource(fc.open(confFile), confFile.toString());
+      jobConf.addResource(fc.open(confFile), confFile.toString(), true);
       return jobConf;
     }
 
@@ -514,6 +528,17 @@ public class HistoryFileManager extends AbstractService {
       final int totalTasks = jobIndexInfo.getNumReduces() +
           jobIndexInfo.getNumMaps();
       return (maxTasksForLoadedJob > 0) && (totalTasks > maxTasksForLoadedJob);
+    }
+
+    public synchronized void waitUntilMoved() {
+      while (isMovePending() && !didMoveFail()) {
+        try {
+          wait();
+        } catch (InterruptedException e) {
+          LOG.warn("Waiting has been interrupted");
+          throw new RuntimeException(e);
+        }
+      }
     }
   }
 
@@ -954,6 +979,7 @@ public class HistoryFileManager extends AbstractService {
           if (LOG.isDebugEnabled()) {
             LOG.debug("Scheduling move to done of " +found);
           }
+
           moveToDoneExecutor.execute(new Runnable() {
             @Override
             public void run() {
@@ -1063,7 +1089,17 @@ public class HistoryFileManager extends AbstractService {
   private void moveToDoneNow(final Path src, final Path target)
       throws IOException {
     LOG.info("Moving " + src.toString() + " to " + target.toString());
-    intermediateDoneDirFc.rename(src, target, Options.Rename.NONE);
+    try {
+      intermediateDoneDirFc.rename(src, target, Options.Rename.NONE);
+    } catch (FileNotFoundException e) {
+      if (doneDirFc.util().exists(target)) {
+        LOG.info("Source file " + src.toString() + " not found, but target "
+            + "file " + target.toString() + " already exists. Move already "
+            + "happened.");
+      } else {
+        throw e;
+      }
+    }
   }
 
   private String getJobSummary(FileContext fc, Path path) throws IOException {
@@ -1191,5 +1227,5 @@ public class HistoryFileManager extends AbstractService {
   @VisibleForTesting
   void setMaxHistoryAge(long newValue){
     maxHistoryAge=newValue;
-  } 
+  }
 }

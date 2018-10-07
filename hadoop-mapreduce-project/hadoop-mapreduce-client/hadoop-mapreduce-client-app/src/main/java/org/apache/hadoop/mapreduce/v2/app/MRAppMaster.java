@@ -18,6 +18,7 @@
 
 package org.apache.hadoop.mapreduce.v2.app;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
@@ -41,8 +42,6 @@ import java.util.regex.Pattern;
 import javax.crypto.KeyGenerator;
 
 import org.apache.commons.io.IOUtils;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
@@ -56,13 +55,13 @@ import org.apache.hadoop.mapred.TaskLog;
 import org.apache.hadoop.mapred.TaskUmbilicalProtocol;
 import org.apache.hadoop.mapreduce.CryptoUtils;
 import org.apache.hadoop.mapreduce.JobContext;
+import org.apache.hadoop.mapreduce.JobStatus.State;
 import org.apache.hadoop.mapreduce.MRJobConfig;
 import org.apache.hadoop.mapreduce.OutputCommitter;
 import org.apache.hadoop.mapreduce.OutputFormat;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
 import org.apache.hadoop.mapreduce.TaskAttemptID;
 import org.apache.hadoop.mapreduce.TypeConverter;
-import org.apache.hadoop.mapreduce.counters.Limits;
 import org.apache.hadoop.mapreduce.jobhistory.AMStartedEvent;
 import org.apache.hadoop.mapreduce.jobhistory.EventReader;
 import org.apache.hadoop.mapreduce.jobhistory.EventType;
@@ -156,6 +155,8 @@ import org.apache.hadoop.yarn.util.Clock;
 import org.apache.hadoop.yarn.util.SystemClock;
 
 import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * The Map-Reduce Application Master.
@@ -178,7 +179,7 @@ import com.google.common.annotations.VisibleForTesting;
 @SuppressWarnings("rawtypes")
 public class MRAppMaster extends CompositeService {
 
-  private static final Log LOG = LogFactory.getLog(MRAppMaster.class);
+  private static final Logger LOG = LoggerFactory.getLogger(MRAppMaster.class);
 
   /**
    * Priority of the MRAppMaster shutdown hook.
@@ -328,7 +329,7 @@ public class MRAppMaster extends CompositeService {
         errorHappenedShutDown = true;
         forcedState = JobStateInternal.ERROR;
         shutDownMessage = "Staging dir does not exist " + stagingDir;
-        LOG.fatal(shutDownMessage);
+        LOG.error(shutDownMessage);
       } else if (commitStarted) {
         //A commit was started so this is the last time, we just need to know
         // what result we will use to notify, and how we will unregister
@@ -1079,6 +1080,7 @@ public class MRAppMaster extends CompositeService {
     private final ClientToAMTokenSecretManager clientToAMTokenSecretManager;
     private TimelineClient timelineClient = null;
     private TimelineV2Client timelineV2Client = null;
+    private String historyUrl = null;
 
     private final TaskAttemptFinishingMonitor taskAttemptFinishingMonitor;
 
@@ -1198,6 +1200,16 @@ public class MRAppMaster extends CompositeService {
     public TimelineV2Client getTimelineV2Client() {
       return timelineV2Client;
     }
+
+    @Override
+    public String getHistoryUrl() {
+      return historyUrl;
+    }
+
+    @Override
+    public void setHistoryUrl(String historyUrl) {
+      this.historyUrl = historyUrl;
+    }
   }
 
   @SuppressWarnings("unchecked")
@@ -1207,6 +1219,7 @@ public class MRAppMaster extends CompositeService {
     amInfos = new LinkedList<AMInfo>();
     completedTasksFromPreviousRun = new HashMap<TaskId, TaskInfo>();
     processRecovery();
+    cleanUpPreviousJobOutput();
 
     // Current an AMInfo for the current AM generation.
     AMInfo amInfo =
@@ -1242,7 +1255,7 @@ public class MRAppMaster extends CompositeService {
 
     boolean initFailed = false;
     if (!errorHappenedShutDown) {
-      // create a job event for job intialization
+      // create a job event for job initialization
       JobEvent initJobEvent = new JobEvent(job.getID(), JobEventType.JOB_INIT);
       // Send init to the job (this does NOT trigger job execution)
       // This is a synchronous call, not an event through dispatcher. We want
@@ -1281,8 +1294,6 @@ public class MRAppMaster extends CompositeService {
 
     // finally set the job classloader
     MRApps.setClassLoader(jobClassLoader, getConfig());
-    // set job classloader if configured
-    Limits.init(getConfig());
 
     if (initFailed) {
       JobEvent initFailedEvent = new JobEvent(job.getID(), JobEventType.JOB_INIT_FAILED);
@@ -1385,6 +1396,26 @@ public class MRAppMaster extends CompositeService {
     }
 
     return true;
+  }
+
+  private void cleanUpPreviousJobOutput() {
+    // recovered application masters should not remove data from previous job
+    if (!isFirstAttempt() && !recovered()) {
+      JobContext jobContext = getJobContextFromConf(getConfig());
+      try {
+        LOG.info("Starting to clean up previous job's temporary files");
+        this.committer.abortJob(jobContext, State.FAILED);
+        LOG.info("Finished cleaning up previous job temporary files");
+      } catch (FileNotFoundException e) {
+        LOG.info("Previous job temporary files do not exist, " +
+            "no clean up was necessary.");
+      } catch (Exception e) {
+        // the clean up of a previous attempt is not critical to the success
+        // of this job - only logging the error
+        LOG.error("Error while trying to clean up previous job's temporary " +
+            "files", e);
+      }
+    }
   }
 
   private static FSDataInputStream getPreviousJobHistoryStream(
@@ -1659,7 +1690,7 @@ public class MRAppMaster extends CompositeService {
       conf.set(MRJobConfig.USER_NAME, jobUserName);
       initAndStartAppMaster(appMaster, conf, jobUserName);
     } catch (Throwable t) {
-      LOG.fatal("Error starting MRAppMaster", t);
+      LOG.error("Error starting MRAppMaster", t);
       ExitUtil.terminate(1, t);
     }
   }
@@ -1708,10 +1739,7 @@ public class MRAppMaster extends CompositeService {
     // them
     Credentials credentials =
         UserGroupInformation.getCurrentUser().getCredentials();
-    LOG.info("Executing with tokens:");
-    for (Token<?> token : credentials.getAllTokens()) {
-      LOG.info(token);
-    }
+    LOG.info("Executing with tokens: {}", credentials.getAllTokens());
     
     UserGroupInformation appMasterUgi = UserGroupInformation
         .createRemoteUser(jobUserName);

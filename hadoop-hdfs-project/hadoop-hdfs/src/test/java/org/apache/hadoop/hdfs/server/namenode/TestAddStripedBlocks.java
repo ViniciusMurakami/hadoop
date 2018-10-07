@@ -19,7 +19,6 @@ package org.apache.hadoop.hdfs.server.namenode;
 
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSStripedOutputStream;
 import org.apache.hadoop.hdfs.DFSTestUtil;
 import org.apache.hadoop.hdfs.DistributedFileSystem;
@@ -85,11 +84,10 @@ public class TestAddStripedBlocks {
   @Before
   public void setup() throws IOException {
     HdfsConfiguration conf = new HdfsConfiguration();
-    conf.set(DFSConfigKeys.DFS_NAMENODE_EC_POLICIES_ENABLED_KEY,
-        ecPolicy.getName());
     cluster = new MiniDFSCluster.Builder(conf).numDataNodes(groupSize).build();
     cluster.waitActive();
     dfs = cluster.getFileSystem();
+    dfs.enableErasureCodingPolicy(ecPolicy.getName());
     dfs.getClient().setErasureCodingPolicy("/", ecPolicy.getName());
   }
 
@@ -339,8 +337,8 @@ public class TestAddStripedBlocks {
     int i = groupSize - 1;
     for (DataNode dn : cluster.getDataNodes()) {
       String storageID = storageIDs.get(i);
-      final Block block = new Block(lastBlock.getBlockId() + i--,
-          lastBlock.getGenerationStamp(), 0);
+      final Block block = new Block(lastBlock.getBlockId() + i--, 0,
+          lastBlock.getGenerationStamp());
       DatanodeStorage storage = new DatanodeStorage(storageID);
       List<ReplicaBeingWritten> blocks = new ArrayList<>();
       ReplicaBeingWritten replica = new ReplicaBeingWritten(block, null, null,
@@ -424,9 +422,9 @@ public class TestAddStripedBlocks {
         cluster.getDataNodes().get(3).getDatanodeId(), reports[0]);
     BlockManagerTestUtil.updateState(ns.getBlockManager());
     // the total number of corrupted block info is still 1
-    Assert.assertEquals(1, ns.getCorruptECBlockGroupsStat());
+    Assert.assertEquals(1, ns.getCorruptECBlockGroups());
     Assert.assertEquals(1, ns.getCorruptReplicaBlocks());
-    Assert.assertEquals(0, ns.getCorruptBlocksStat());
+    Assert.assertEquals(0, ns.getCorruptReplicatedBlocks());
     // 2 internal blocks corrupted
     Assert.assertEquals(2, bm.getCorruptReplicas(stored).size());
 

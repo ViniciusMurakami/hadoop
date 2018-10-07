@@ -24,15 +24,21 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.Writer;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.yarn.api.records.ApplicationAccessType;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
+import org.apache.hadoop.yarn.logaggregation.filecontroller.LogAggregationFileController;
+import org.apache.hadoop.yarn.logaggregation.filecontroller.LogAggregationFileControllerContext;
+import org.apache.hadoop.yarn.logaggregation.filecontroller.LogAggregationFileControllerFactory;
 
 /**
  * This class contains several utility functions for log aggregation tests.
@@ -59,7 +65,7 @@ public final class TestContainerLogsUtils {
   public static void createContainerLogFileInRemoteFS(Configuration conf,
       FileSystem fs, String rootLogDir, ContainerId containerId, NodeId nodeId,
       String fileName, String user, String content,
-      boolean deleteRemoteLogDir) throws IOException {
+      boolean deleteRemoteLogDir) throws Exception {
     UserGroupInformation ugi = UserGroupInformation.createRemoteUser(user);
     //prepare the logs for remote directory
     ApplicationId appId = containerId.getApplicationAttemptId()
@@ -107,17 +113,28 @@ public final class TestContainerLogsUtils {
 
   private static void uploadContainerLogIntoRemoteDir(UserGroupInformation ugi,
       Configuration configuration, List<String> rootLogDirs, NodeId nodeId,
-      ContainerId containerId, Path appDir, FileSystem fs) throws IOException {
+      ContainerId containerId, Path appDir, FileSystem fs) throws Exception {
     Path path =
         new Path(appDir, LogAggregationUtils.getNodeString(nodeId));
-    try (AggregatedLogFormat.LogWriter writer =
-        new AggregatedLogFormat.LogWriter()) {
-      writer.initialize(configuration, path, ugi);
-      writer.writeApplicationOwner(ugi.getUserName());
-
-      writer.append(new AggregatedLogFormat.LogKey(containerId),
+    LogAggregationFileControllerFactory factory
+        = new LogAggregationFileControllerFactory(configuration);
+    LogAggregationFileController fileController = factory
+        .getFileControllerForWrite();
+    try {
+      Map<ApplicationAccessType, String> appAcls = new HashMap<>();
+      appAcls.put(ApplicationAccessType.VIEW_APP, ugi.getUserName());
+      ApplicationId appId = containerId.getApplicationAttemptId()
+          .getApplicationId();
+      LogAggregationFileControllerContext context
+          = new LogAggregationFileControllerContext(
+              path, path, true, 1000,
+              appId, appAcls, nodeId, ugi);
+      fileController.initializeWriter(context);
+      fileController.write(new AggregatedLogFormat.LogKey(containerId),
           new AggregatedLogFormat.LogValue(rootLogDirs, containerId,
               ugi.getShortUserName()));
+    } finally {
+      fileController.closeWriter();
     }
   }
 }

@@ -28,8 +28,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.classification.InterfaceStability.Unstable;
 import org.apache.hadoop.conf.Configuration;
@@ -43,6 +41,8 @@ import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.TokenIdentifier;
 import org.apache.hadoop.yarn.api.ApplicationClientProtocol;
 import org.apache.hadoop.yarn.api.protocolrecords.FailApplicationAttemptRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAllResourceProfilesRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAllResourceTypeInfoRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationAttemptReportRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationAttemptReportResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationAttemptsRequest;
@@ -51,8 +51,10 @@ import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationReportRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationReportResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationsRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationsResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAttributesToNodesRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterMetricsRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterMetricsResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetClusterNodeAttributesRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterNodeLabelsRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterNodesRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterNodesResponse;
@@ -67,9 +69,11 @@ import org.apache.hadoop.yarn.api.protocolrecords.GetNewApplicationRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNewApplicationResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNewReservationRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNewReservationResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetNodesToAttributesRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNodesToLabelsRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetQueueInfoRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetQueueUserAclsInfoRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetResourceProfileRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.KillApplicationRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.KillApplicationResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.MoveApplicationAcrossQueuesRequest;
@@ -94,13 +98,19 @@ import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerLaunchContext;
 import org.apache.hadoop.yarn.api.records.ContainerReport;
+import org.apache.hadoop.yarn.api.records.NodeAttribute;
+import org.apache.hadoop.yarn.api.records.NodeAttributeKey;
+import org.apache.hadoop.yarn.api.records.NodeAttributeInfo;
 import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.NodeLabel;
 import org.apache.hadoop.yarn.api.records.NodeReport;
 import org.apache.hadoop.yarn.api.records.NodeState;
+import org.apache.hadoop.yarn.api.records.NodeToAttributeValue;
 import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.QueueInfo;
 import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
+import org.apache.hadoop.yarn.api.records.Resource;
+import org.apache.hadoop.yarn.api.records.ResourceTypeInfo;
 import org.apache.hadoop.yarn.api.records.SignalContainerCommand;
 import org.apache.hadoop.yarn.api.records.Token;
 import org.apache.hadoop.yarn.api.records.YarnApplicationState;
@@ -120,15 +130,19 @@ import org.apache.hadoop.yarn.security.AMRMTokenIdentifier;
 import org.apache.hadoop.yarn.security.client.TimelineDelegationTokenIdentifier;
 import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.Records;
+import org.apache.hadoop.yarn.util.resource.ResourceUtils;
 import org.apache.hadoop.yarn.util.timeline.TimelineUtils;
 
 import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @Private
 @Unstable
 public class YarnClientImpl extends YarnClient {
 
-  private static final Log LOG = LogFactory.getLog(YarnClientImpl.class);
+  private static final Logger LOG = LoggerFactory
+          .getLogger(YarnClientImpl.class);
 
   protected ApplicationClientProtocol rmClient;
   protected long submitPollIntervalMillis;
@@ -143,6 +157,7 @@ public class YarnClientImpl extends YarnClient {
   String timelineDTRenewer;
   private boolean timelineV1ServiceEnabled;
   protected boolean timelineServiceBestEffort;
+  private boolean loadResourceTypesFromServer;
 
   private static final String ROOT = "root";
 
@@ -167,13 +182,7 @@ public class YarnClientImpl extends YarnClient {
         YarnConfiguration.DEFAULT_YARN_CLIENT_APPLICATION_CLIENT_PROTOCOL_POLL_INTERVAL_MS);
     }
 
-    float timelineServiceVersion =
-        conf.getFloat(YarnConfiguration.TIMELINE_SERVICE_VERSION,
-            YarnConfiguration.DEFAULT_TIMELINE_SERVICE_VERSION);
-    if (conf.getBoolean(YarnConfiguration.TIMELINE_SERVICE_ENABLED,
-        YarnConfiguration.DEFAULT_TIMELINE_SERVICE_ENABLED)
-        && ((Float.compare(timelineServiceVersion, 1.0f) == 0)
-            || (Float.compare(timelineServiceVersion, 1.5f) == 0))) {
+    if (YarnConfiguration.timelineServiceV1Enabled(conf)) {
       timelineV1ServiceEnabled = true;
       timelineDTRenewer = getTimelineDelegationTokenRenewer(conf);
       timelineService = TimelineUtils.buildTimelineTokenService(conf);
@@ -194,6 +203,11 @@ public class YarnClientImpl extends YarnClient {
     timelineServiceBestEffort = conf.getBoolean(
         YarnConfiguration.TIMELINE_SERVICE_CLIENT_BEST_EFFORT,
         YarnConfiguration.DEFAULT_TIMELINE_SERVICE_CLIENT_BEST_EFFORT);
+
+    loadResourceTypesFromServer = conf.getBoolean(
+        YarnConfiguration.YARN_CLIENT_LOAD_RESOURCETYPES_FROM_SERVER,
+        YarnConfiguration.DEFAULT_YARN_CLIENT_LOAD_RESOURCETYPES_FROM_SERVER);
+
     super.serviceInit(conf);
   }
 
@@ -212,6 +226,13 @@ public class YarnClientImpl extends YarnClient {
     } catch (IOException e) {
       throw new YarnRuntimeException(e);
     }
+
+    // Reinitialize local resource types cache from list of resources pulled from
+    // RM.
+    if (loadResourceTypesFromServer) {
+      ResourceUtils.reinitializeResources(getResourceTypeInfo());
+    }
+
     super.serviceStart();
   }
 
@@ -384,7 +405,7 @@ public class YarnClientImpl extends YarnClient {
             + e.getMessage());
         return null;
       }
-      throw e;
+      throw new IOException(e);
     } catch (NoClassDefFoundError e) {
       NoClassDefFoundError wrappedError = new NoClassDefFoundError(
           e.getMessage() + ". It appears that the timeline client "
@@ -936,5 +957,53 @@ public class YarnClientImpl extends YarnClient {
       UpdateApplicationTimeoutsRequest request)
       throws YarnException, IOException {
     return rmClient.updateApplicationTimeouts(request);
+  }
+
+  @Override
+  public Map<String, Resource> getResourceProfiles()
+      throws YarnException, IOException {
+    GetAllResourceProfilesRequest request =
+        GetAllResourceProfilesRequest.newInstance();
+    return rmClient.getResourceProfiles(request).getResourceProfiles();
+  }
+
+  @Override
+  public Resource getResourceProfile(String profile)
+      throws YarnException, IOException {
+    GetResourceProfileRequest request = GetResourceProfileRequest
+        .newInstance(profile);
+    return rmClient.getResourceProfile(request).getResource();
+  }
+
+  @Override
+  public List<ResourceTypeInfo> getResourceTypeInfo()
+      throws YarnException, IOException {
+    GetAllResourceTypeInfoRequest request =
+        GetAllResourceTypeInfoRequest.newInstance();
+    return rmClient.getResourceTypeInfo(request).getResourceTypeInfo();
+  }
+
+  @Override
+  public Set<NodeAttributeInfo> getClusterAttributes()
+      throws YarnException, IOException {
+    GetClusterNodeAttributesRequest request =
+        GetClusterNodeAttributesRequest.newInstance();
+    return rmClient.getClusterNodeAttributes(request).getNodeAttributes();
+  }
+
+  @Override
+  public Map<NodeAttributeKey, List<NodeToAttributeValue>> getAttributesToNodes(
+      Set<NodeAttributeKey> attributes) throws YarnException, IOException {
+    GetAttributesToNodesRequest request =
+        GetAttributesToNodesRequest.newInstance(attributes);
+    return rmClient.getAttributesToNodes(request).getAttributesToNodes();
+  }
+
+  @Override
+  public Map<String, Set<NodeAttribute>> getNodeToAttributes(
+      Set<String> hostNames) throws YarnException, IOException {
+    GetNodesToAttributesRequest request =
+        GetNodesToAttributesRequest.newInstance(hostNames);
+    return rmClient.getNodesToAttributes(request).getNodeToAttributes();
   }
 }

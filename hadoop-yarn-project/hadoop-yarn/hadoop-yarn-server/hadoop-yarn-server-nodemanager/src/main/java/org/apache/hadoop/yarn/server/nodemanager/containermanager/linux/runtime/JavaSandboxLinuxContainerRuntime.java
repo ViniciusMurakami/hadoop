@@ -19,18 +19,18 @@
 package org.apache.hadoop.yarn.server.nodemanager.
     containermanager.linux.runtime;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.security.Groups;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
+import org.apache.hadoop.yarn.server.nodemanager.Context;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.privileged.PrivilegedOperationExecutor;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.runtime.ContainerExecutionException;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.runtime.ContainerRuntimeContext;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.FilePermission;
 import java.io.IOException;
@@ -73,7 +73,8 @@ import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.r
  *
  * <ul>
  *   <li>
- *     {@value YarnConfiguration#YARN_CONTAINER_SANDBOX} :
+ *     {@value
+ *     org.apache.hadoop.yarn.conf.YarnConfiguration#YARN_CONTAINER_SANDBOX} :
  *     This yarn-site.xml setting has three options:
  *     <ul>
  *     <li>disabled - Default behavior. {@link LinuxContainerRuntime}
@@ -86,26 +87,33 @@ import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.r
  *     </ul>
  *   </li>
  *   <li>
- *     {@value YarnConfiguration#YARN_CONTAINER_SANDBOX_FILE_PERMISSIONS} :
+ *     {@value
+ *     org.apache.hadoop.yarn.conf.YarnConfiguration#YARN_CONTAINER_SANDBOX_FILE_PERMISSIONS}
+ *     :
  *     Determines the file permissions for the application directories.  The
  *     permissions come in the form of comma separated values
  *     (e.g. read,write,execute,delete). Defaults to {@code read} for read-only.
  *   </li>
  *   <li>
- *     {@value YarnConfiguration#YARN_CONTAINER_SANDBOX_POLICY} :
+ *     {@value
+ *     org.apache.hadoop.yarn.conf.YarnConfiguration#YARN_CONTAINER_SANDBOX_POLICY}
+ *     :
  *     Accepts canonical path to a java policy file on the local filesystem.
  *     This file will be loaded as the base policy, any additional container
  *     grants will be appended to this base file.  If not specified, the default
  *     java.policy file provided with hadoop resources will be used.
  *   </li>
  *   <li>
- *     {@value YarnConfiguration#YARN_CONTAINER_SANDBOX_WHITELIST_GROUP} :
+ *     {@value
+ *     org.apache.hadoop.yarn.conf.YarnConfiguration#YARN_CONTAINER_SANDBOX_WHITELIST_GROUP}
+ *     :
  *     Optional setting to specify a YARN queue which will be exempt from the
  *     sand-boxing process.
  *   </li>
  *   <li>
  *     {@value
- *     YarnConfiguration#YARN_CONTAINER_SANDBOX_POLICY_GROUP_PREFIX}$groupName :
+ *     org.apache.hadoop.yarn.conf.YarnConfiguration#YARN_CONTAINER_SANDBOX_POLICY_GROUP_PREFIX}$groupName
+ *     :
  *     Optional setting to map groups to java policy files.  The value is a path
  *     to the java policy file for $groupName.  A user which is a member of
  *     multiple groups with different policies will receive the superset of all
@@ -117,8 +125,8 @@ import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.r
 @InterfaceStability.Unstable
 public class JavaSandboxLinuxContainerRuntime
     extends DefaultLinuxContainerRuntime {
-  private static final Log LOG =
-      LogFactory.getLog(DefaultLinuxContainerRuntime.class);
+  private static final Logger LOG =
+      LoggerFactory.getLogger(DefaultLinuxContainerRuntime.class);
   private Configuration configuration;
   private SandboxMode sandboxMode;
 
@@ -144,7 +152,7 @@ public class JavaSandboxLinuxContainerRuntime
   }
 
   @Override
-  public void initialize(Configuration conf)
+  public void initialize(Configuration conf, Context nmContext)
       throws ContainerExecutionException {
     this.configuration = conf;
     this.sandboxMode =
@@ -152,7 +160,7 @@ public class JavaSandboxLinuxContainerRuntime
             this.configuration.get(YARN_CONTAINER_SANDBOX,
                 YarnConfiguration.DEFAULT_YARN_CONTAINER_SANDBOX));
 
-    super.initialize(conf);
+    super.initialize(conf, nmContext);
   }
 
   /**
@@ -197,9 +205,10 @@ public class JavaSandboxLinuxContainerRuntime
    *  <br>
    *  The Java Sandbox will be circumvented if the user is a member of the
    *  group specified in:
-   *  {@value YarnConfiguration#YARN_CONTAINER_SANDBOX_WHITELIST_GROUP} and if
-   *  they do not include the JVM flag:
-   *  {@value NMContainerPolicyUtils#SECURITY_FLAG}
+   *  {@value
+   *  org.apache.hadoop.yarn.conf.YarnConfiguration#YARN_CONTAINER_SANDBOX_WHITELIST_GROUP}
+   *  and if they do not include the JVM flag
+   *  <code>-Djava.security.manager</code>.
    *
    * @param ctx The {@link ContainerRuntimeContext} containing container
    *            setup properties.
@@ -231,7 +240,6 @@ public class JavaSandboxLinuxContainerRuntime
         throw new ContainerExecutionException("hadoop.tmp.dir not set!");
       }
 
-      OutputStream policyOutputStream = null;
       try {
         String containerID = ctx.getExecutionAttribute(CONTAINER_ID_STR);
         initializePolicyDir();
@@ -242,19 +250,19 @@ public class JavaSandboxLinuxContainerRuntime
             Paths.get(policyFileDir.toString(),
             containerID + "-" + NMContainerPolicyUtils.POLICY_FILE),
             POLICY_ATTR);
-        policyOutputStream = Files.newOutputStream(policyFilePath);
 
-        containerPolicies.put(containerID, policyFilePath);
+        try(OutputStream policyOutputStream =
+                Files.newOutputStream(policyFilePath)) {
 
-        NMContainerPolicyUtils.generatePolicyFile(policyOutputStream,
-            localDirs, groupPolicyFiles, resources, configuration);
-        NMContainerPolicyUtils.appendSecurityFlags(
-            commands, env, policyFilePath, sandboxMode);
+          containerPolicies.put(containerID, policyFilePath);
 
+          NMContainerPolicyUtils.generatePolicyFile(policyOutputStream,
+              localDirs, groupPolicyFiles, resources, configuration);
+          NMContainerPolicyUtils.appendSecurityFlags(
+              commands, env, policyFilePath, sandboxMode);
+        }
       } catch (IOException e) {
         throw new ContainerExecutionException(e);
-      } finally {
-        IOUtils.cleanup(LOG, policyOutputStream);
       }
     }
   }
@@ -269,13 +277,26 @@ public class JavaSandboxLinuxContainerRuntime
     }
   }
 
+  @Override
+  public void relaunchContainer(ContainerRuntimeContext ctx)
+      throws ContainerExecutionException {
+    try {
+      super.relaunchContainer(ctx);
+    } finally {
+      deletePolicyFiles(ctx);
+    }
+  }
+
   /**
    * Determine if JVMSandboxLinuxContainerRuntime should be used.  This is
    * decided based on the value of
-   * {@value YarnConfiguration#YARN_CONTAINER_SANDBOX}
+   * {@value
+   * org.apache.hadoop.yarn.conf.YarnConfiguration#YARN_CONTAINER_SANDBOX}
+   * @param env the environment variable settings for the operation
    * @return true if Sandbox is requested, false otherwise
    */
-  boolean isSandboxContainerRequested() {
+  @Override
+  public boolean isRuntimeRequested(Map<String, String> env) {
     return sandboxMode != SandboxMode.disabled;
   }
 
@@ -417,7 +438,7 @@ public class JavaSandboxLinuxContainerRuntime
         + SEPARATOR + "-\" {%n" +
         "  permission " + AllPermission.class.getCanonicalName() + ";%n};%n";
     static final Logger LOG =
-        Logger.getLogger(NMContainerPolicyUtils.class);
+            LoggerFactory.getLogger(NMContainerPolicyUtils.class);
 
     /**
      * Write new policy file to policyOutStream which will include read access

@@ -197,7 +197,7 @@ public class FileSystemRMStateStore extends RMStateStore {
   @Override
   public synchronized long getAndIncrementEpoch() throws Exception {
     Path epochNodePath = getNodePath(rootDirPath, EPOCH_NODE);
-    long currentEpoch = 0;
+    long currentEpoch = baseEpoch;
     FileStatus status = getFileStatusWithRetries(epochNodePath);
     if (status != null) {
       // load current epoch
@@ -205,12 +205,12 @@ public class FileSystemRMStateStore extends RMStateStore {
       Epoch epoch = new EpochPBImpl(EpochProto.parseFrom(data));
       currentEpoch = epoch.getEpoch();
       // increment epoch and store it
-      byte[] storeData = Epoch.newInstance(currentEpoch + 1).getProto()
+      byte[] storeData = Epoch.newInstance(nextEpoch(currentEpoch)).getProto()
           .toByteArray();
       updateFile(epochNodePath, storeData, false);
     } else {
       // initialize epoch file with 1 for the next time.
-      byte[] storeData = Epoch.newInstance(currentEpoch + 1).getProto()
+      byte[] storeData = Epoch.newInstance(nextEpoch(currentEpoch)).getProto()
           .toByteArray();
       writeFileWithRetries(epochNodePath, storeData, false);
     }
@@ -378,12 +378,10 @@ public class FileSystemRMStateStore extends RMStateStore {
           }
         } else if (childNodeName.startsWith(DELEGATION_TOKEN_PREFIX)) {
           RMDelegationTokenIdentifierData identifierData =
-              new RMDelegationTokenIdentifierData();
-          identifierData.readFields(fsIn);
+              RMStateStoreUtils.readRMDelegationTokenIdentifierData(fsIn);
           RMDelegationTokenIdentifier identifier =
               identifierData.getTokenIdentifier();
           long renewDate = identifierData.getRenewDate();
-
           rmState.rmSecretManagerState.delegationTokenState.put(identifier,
             renewDate);
           if (LOG.isDebugEnabled()) {

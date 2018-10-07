@@ -1,7 +1,5 @@
 {
   "directory": "bower_components",
   "analytics": false,
-  "resolvers": [
-    "bower-shrinkwrap-resolver-ext"
-  ]
+  "registry": "https://registry.bower.io"
 }

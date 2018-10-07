@@ -24,17 +24,19 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.net.InetAddresses;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.HadoopIllegalArgumentException;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.net.DFSNetworkTopology;
 import org.apache.hadoop.hdfs.protocol.*;
+import org.apache.hadoop.hdfs.protocol.DatanodeInfo.DatanodeInfoBuilder;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.DatanodeReportType;
 import org.apache.hadoop.hdfs.security.token.block.BlockTokenIdentifier;
 import org.apache.hadoop.hdfs.server.blockmanagement.DatanodeDescriptor.BlockTargetPair;
@@ -71,11 +73,11 @@ import java.util.concurrent.TimeUnit;
 @InterfaceAudience.Private
 @InterfaceStability.Evolving
 public class DatanodeManager {
-  static final Log LOG = LogFactory.getLog(DatanodeManager.class);
+  static final Logger LOG = LoggerFactory.getLogger(DatanodeManager.class);
 
   private final Namesystem namesystem;
   private final BlockManager blockManager;
-  private final DecommissionManager decomManager;
+  private final DatanodeAdminManager datanodeAdminManager;
   private final HeartbeatManager heartbeatManager;
   private final FSClusterStats fsClusterStats;
 
@@ -212,8 +214,6 @@ public class DatanodeManager {
     this.namesystem = namesystem;
     this.blockManager = blockManager;
 
-    // TODO: Enables DFSNetworkTopology by default after more stress
-    // testings/validations.
     this.useDfsNetworkTopology = conf.getBoolean(
         DFSConfigKeys.DFS_USE_DFS_NETWORK_TOPOLOGY_KEY,
         DFSConfigKeys.DFS_USE_DFS_NETWORK_TOPOLOGY_DEFAULT);
@@ -223,9 +223,10 @@ public class DatanodeManager {
       networktopology = NetworkTopology.getInstance(conf);
     }
 
-    this.heartbeatManager = new HeartbeatManager(namesystem, blockManager, conf);
-    this.decomManager = new DecommissionManager(namesystem, blockManager,
-        heartbeatManager);
+    this.heartbeatManager = new HeartbeatManager(namesystem,
+        blockManager, conf);
+    this.datanodeAdminManager = new DatanodeAdminManager(namesystem,
+        blockManager, heartbeatManager);
     this.fsClusterStats = newFSClusterStats();
     this.dataNodePeerStatsEnabled = conf.getBoolean(
         DFSConfigKeys.DFS_DATANODE_PEER_STATS_ENABLED_KEY,
@@ -290,12 +291,19 @@ public class DatanodeManager {
         DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_DEFAULT); // 5 minutes
     this.heartbeatExpireInterval = 2 * heartbeatRecheckInterval
         + 10 * 1000 * heartbeatIntervalSeconds;
-    final int blockInvalidateLimit = Math.max(20*(int)(heartbeatIntervalSeconds),
+
+    // Effected block invalidate limit is the bigger value between
+    // value configured in hdfs-site.xml, and 20 * HB interval.
+    final int configuredBlockInvalidateLimit = conf.getInt(
+        DFSConfigKeys.DFS_BLOCK_INVALIDATE_LIMIT_KEY,
         DFSConfigKeys.DFS_BLOCK_INVALIDATE_LIMIT_DEFAULT);
-    this.blockInvalidateLimit = conf.getInt(
-        DFSConfigKeys.DFS_BLOCK_INVALIDATE_LIMIT_KEY, blockInvalidateLimit);
+    final int countedBlockInvalidateLimit = 20*(int)(heartbeatIntervalSeconds);
+    this.blockInvalidateLimit = Math.max(countedBlockInvalidateLimit,
+        configuredBlockInvalidateLimit);
     LOG.info(DFSConfigKeys.DFS_BLOCK_INVALIDATE_LIMIT_KEY
-        + "=" + this.blockInvalidateLimit);
+        + ": configured=" + configuredBlockInvalidateLimit
+        + ", counted=" + countedBlockInvalidateLimit
+        + ", effected=" + blockInvalidateLimit);
 
     this.checkIpHostnameInRegistration = conf.getBoolean(
         DFSConfigKeys.DFS_NAMENODE_DATANODE_REGISTRATION_IP_HOSTNAME_CHECK_KEY,
@@ -365,12 +373,12 @@ public class DatanodeManager {
   }
   
   void activate(final Configuration conf) {
-    decomManager.activate(conf);
+    datanodeAdminManager.activate(conf);
     heartbeatManager.activate();
   }
 
   void close() {
-    decomManager.close();
+    datanodeAdminManager.close();
     heartbeatManager.close();
   }
 
@@ -385,8 +393,8 @@ public class DatanodeManager {
   }
 
   @VisibleForTesting
-  public DecommissionManager getDecomManager() {
-    return decomManager;
+  public DatanodeAdminManager getDatanodeAdminManager() {
+    return datanodeAdminManager;
   }
 
   public HostConfigManager getHostConfigManager() {
@@ -403,7 +411,8 @@ public class DatanodeManager {
     return fsClusterStats;
   }
 
-  int getBlockInvalidateLimit() {
+  @VisibleForTesting
+  public int getBlockInvalidateLimit() {
     return blockInvalidateLimit;
   }
 
@@ -525,6 +534,8 @@ public class DatanodeManager {
     } else {
       networktopology.sortByDistance(client, lb.getLocations(), activeLen);
     }
+    // move PROVIDED storage to the end to prefer local replicas.
+    lb.moveProvidedToEnd(activeLen);
     // must update cache since we modified locations array
     lb.updateCachedStorageInfo();
   }
@@ -983,9 +994,9 @@ public class DatanodeManager {
         hostConfigManager.getMaintenanceExpirationTimeInMS(nodeReg);
     // If the registered node is in exclude list, then decommission it
     if (getHostConfigManager().isExcluded(nodeReg)) {
-      decomManager.startDecommission(nodeReg);
+      datanodeAdminManager.startDecommission(nodeReg);
     } else if (nodeReg.maintenanceNotExpired(maintenanceExpireTimeInMS)) {
-      decomManager.startMaintenance(nodeReg, maintenanceExpireTimeInMS);
+      datanodeAdminManager.startMaintenance(nodeReg, maintenanceExpireTimeInMS);
     }
   }
 
@@ -1211,12 +1222,13 @@ public class DatanodeManager {
         long maintenanceExpireTimeInMS =
             hostConfigManager.getMaintenanceExpirationTimeInMS(node);
         if (node.maintenanceNotExpired(maintenanceExpireTimeInMS)) {
-          decomManager.startMaintenance(node, maintenanceExpireTimeInMS);
+          datanodeAdminManager.startMaintenance(
+              node, maintenanceExpireTimeInMS);
         } else if (hostConfigManager.isExcluded(node)) {
-          decomManager.startDecommission(node);
+          datanodeAdminManager.startDecommission(node);
         } else {
-          decomManager.stopMaintenance(node);
-          decomManager.stopDecommission(node);
+          datanodeAdminManager.stopMaintenance(node);
+          datanodeAdminManager.stopDecommission(node);
         }
       }
       node.setUpgradeDomain(hostConfigManager.getUpgradeDomain(node));
@@ -1530,7 +1542,7 @@ public class DatanodeManager {
   }
 
   private BlockRecoveryCommand getBlockRecoveryCommand(String blockPoolId,
-      DatanodeDescriptor nodeinfo) {
+      DatanodeDescriptor nodeinfo) throws IOException {
     BlockInfo[] blocks = nodeinfo.getLeaseRecoveryCommand(Integer.MAX_VALUE);
     if (blocks == null) {
       return null;
@@ -1538,7 +1550,10 @@ public class DatanodeManager {
     BlockRecoveryCommand brCommand = new BlockRecoveryCommand(blocks.length);
     for (BlockInfo b : blocks) {
       BlockUnderConstructionFeature uc = b.getUnderConstructionFeature();
-      assert uc != null;
+      if(uc == null) {
+        throw new IOException("Recovery block " + b +
+            "where it is not under construction.");
+      }
       final DatanodeStorageInfo[] storages = uc.getExpectedStorageLocations();
       // Skip stale nodes during recovery
       final List<DatanodeStorageInfo> recoveryLocations =
@@ -1655,21 +1670,37 @@ public class DatanodeManager {
     }
 
     final List<DatanodeCommand> cmds = new ArrayList<>();
-    // check pending replication
-    List<BlockTargetPair> pendingList = nodeinfo.getReplicationCommand(
-        maxTransfers);
-    if (pendingList != null) {
-      cmds.add(new BlockCommand(DatanodeProtocol.DNA_TRANSFER, blockPoolId,
-          pendingList));
-      maxTransfers -= pendingList.size();
+    // Allocate _approximately_ maxTransfers pending tasks to DataNode.
+    // NN chooses pending tasks based on the ratio between the lengths of
+    // replication and erasure-coded block queues.
+    int totalReplicateBlocks = nodeinfo.getNumberOfReplicateBlocks();
+    int totalECBlocks = nodeinfo.getNumberOfBlocksToBeErasureCoded();
+    int totalBlocks = totalReplicateBlocks + totalECBlocks;
+    if (totalBlocks > 0) {
+      int numReplicationTasks = (int) Math.ceil(
+          (double) (totalReplicateBlocks * maxTransfers) / totalBlocks);
+      int numECTasks = (int) Math.ceil(
+          (double) (totalECBlocks * maxTransfers) / totalBlocks);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Pending replication tasks: " + numReplicationTasks
+            + " erasure-coded tasks: " + numECTasks);
+      }
+      // check pending replication tasks
+      List<BlockTargetPair> pendingList = nodeinfo.getReplicationCommand(
+          numReplicationTasks);
+      if (pendingList != null && !pendingList.isEmpty()) {
+        cmds.add(new BlockCommand(DatanodeProtocol.DNA_TRANSFER, blockPoolId,
+            pendingList));
+      }
+      // check pending erasure coding tasks
+      List<BlockECReconstructionInfo> pendingECList = nodeinfo
+          .getErasureCodeCommand(numECTasks);
+      if (pendingECList != null && !pendingECList.isEmpty()) {
+        cmds.add(new BlockECReconstructionCommand(
+            DNA_ERASURE_CODING_RECONSTRUCTION, pendingECList));
+      }
     }
-    // check pending erasure coding tasks
-    List<BlockECReconstructionInfo> pendingECList = nodeinfo
-        .getErasureCodeCommand(maxTransfers);
-    if (pendingECList != null) {
-      cmds.add(new BlockECReconstructionCommand(
-          DNA_ERASURE_CODING_RECONSTRUCTION, pendingECList));
-    }
+
     // check block invalidation
     Block[] blks = nodeinfo.getInvalidateBlocks(blockInvalidateLimit);
     if (blks != null) {
@@ -1807,7 +1838,7 @@ public class DatanodeManager {
   }
   
   public void markAllDatanodesStale() {
-    LOG.info("Marking all datandoes as stale");
+    LOG.info("Marking all datanodes as stale");
     synchronized (this) {
       for (DatanodeDescriptor dn : datanodeMap.values()) {
         for(DatanodeStorageInfo storage : dn.getStorageInfos()) {
@@ -1911,7 +1942,7 @@ public class DatanodeManager {
     this.heartbeatExpireInterval = 2L * recheckInterval + 10 * 1000
         * intervalSeconds;
     this.blockInvalidateLimit = Math.max(20 * (int) (intervalSeconds),
-        DFSConfigKeys.DFS_BLOCK_INVALIDATE_LIMIT_DEFAULT);
+        blockInvalidateLimit);
   }
 
   /**
@@ -1938,6 +1969,27 @@ public class DatanodeManager {
   public String getSlowDisksReport() {
     return slowDiskTracker != null ?
         slowDiskTracker.getSlowDiskReportAsJsonString() : null;
+  }
+
+  /**
+   * Generates datanode reports for the given report type.
+   *
+   * @param type
+   *          type of the datanode report
+   * @return array of DatanodeStorageReports
+   */
+  public DatanodeStorageReport[] getDatanodeStorageReport(
+      DatanodeReportType type) {
+    final List<DatanodeDescriptor> datanodes = getDatanodeListForReport(type);
+
+    DatanodeStorageReport[] reports = new DatanodeStorageReport[datanodes
+        .size()];
+    for (int i = 0; i < reports.length; i++) {
+      final DatanodeDescriptor d = datanodes.get(i);
+      reports[i] = new DatanodeStorageReport(
+          new DatanodeInfoBuilder().setFrom(d).build(), d.getStorageReports());
+    }
+    return reports;
   }
 }
 

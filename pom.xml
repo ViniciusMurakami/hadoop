@@ -18,7 +18,7 @@ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xs
   <modelVersion>4.0.0</modelVersion>
   <groupId>org.apache.hadoop</groupId>
   <artifactId>hadoop-main</artifactId>
-  <version>3.0.0-beta1-SNAPSHOT</version>
+  <version>3.3.0-SNAPSHOT</version>
   <description>Apache Hadoop Main</description>
   <name>Apache Hadoop Main</name>
   <packaging>pom</packaging>
@@ -79,6 +79,9 @@ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xs
   </organization>
 
   <properties>
+    <!-- required as child projects with different version can't use ${project.version} -->
+    <hadoop.version>3.3.0-SNAPSHOT</hadoop.version>
+
     <distMgmtSnapshotsId>apache.snapshots.https</distMgmtSnapshotsId>
     <distMgmtSnapshotsName>Apache Development Snapshot Repository</distMgmtSnapshotsName>
     <distMgmtSnapshotsUrl>https://repository.apache.org/content/repositories/snapshots</distMgmtSnapshotsUrl>
@@ -92,26 +95,29 @@ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xs
 
     <!-- maven plugin versions -->
     <maven-deploy-plugin.version>2.8.1</maven-deploy-plugin.version>
-    <maven-site-plugin.version>3.5</maven-site-plugin.version>
+    <maven-site-plugin.version>3.6</maven-site-plugin.version>
     <maven-stylus-skin.version>1.5</maven-stylus-skin.version>
     <maven-antrun-plugin.version>1.7</maven-antrun-plugin.version>
     <maven-assembly-plugin.version>2.4</maven-assembly-plugin.version>
-    <maven-dependency-plugin.version>2.10</maven-dependency-plugin.version>
-    <maven-enforcer-plugin.version>1.4.1</maven-enforcer-plugin.version>
-    <maven-javadoc-plugin.version>2.10.4</maven-javadoc-plugin.version>
+    <maven-dependency-plugin.version>3.0.2</maven-dependency-plugin.version>
+    <maven-enforcer-plugin.version>3.0.0-M1</maven-enforcer-plugin.version>
+    <maven-javadoc-plugin.version>3.0.1</maven-javadoc-plugin.version>
     <maven-gpg-plugin.version>1.5</maven-gpg-plugin.version>
     <maven-remote-resources-plugin.version>1.5</maven-remote-resources-plugin.version>
     <maven-resources-plugin.version>3.0.1</maven-resources-plugin.version>
-    <apache-rat-plugin.version>0.10</apache-rat-plugin.version>
-    <wagon-ssh.version>1.0</wagon-ssh.version>
+    <apache-rat-plugin.version>0.12</apache-rat-plugin.version>
+    <wagon-ssh.version>2.4</wagon-ssh.version>
     <maven-clover2-plugin.version>3.3.0</maven-clover2-plugin.version>
     <maven-bundle-plugin.version>2.5.0</maven-bundle-plugin.version>
     <lifecycle-mapping.version>1.0.0</lifecycle-mapping.version>
-    <maven-checkstyle-plugin.version>2.17</maven-checkstyle-plugin.version>
-    <checkstyle.version>7.5.1</checkstyle.version>
+    <maven-checkstyle-plugin.version>3.0.0</maven-checkstyle-plugin.version>
+    <checkstyle.version>8.8</checkstyle.version>
     <dependency-check-maven.version>1.4.3</dependency-check-maven.version>
 
     <shell-executable>bash</shell-executable>
+
+    <!-- version for hdds/ozone components -->
+    <hdds.version>0.3.0-SNAPSHOT</hdds.version>
   </properties>
 
   <modules>
@@ -183,6 +189,11 @@ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xs
               <groupId>org.apache.maven.wagon</groupId>
               <artifactId>wagon-ssh</artifactId>
               <version>${wagon-ssh.version}</version>
+            </dependency>
+            <dependency>
+              <groupId>org.apache.maven.doxia</groupId>
+              <artifactId>doxia-module-markdown</artifactId>
+              <version>1.8</version>
             </dependency>
           </dependencies>
         </plugin>
@@ -311,7 +322,7 @@ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xs
             <dependency>
               <groupId>org.apache.hadoop</groupId>
               <artifactId>hadoop-build-tools</artifactId>
-              <version>${project.version}</version>
+              <version>${hadoop.version}</version>
             </dependency>
             <dependency>
               <groupId>com.puppycrawl.tools</groupId>
@@ -364,6 +375,23 @@ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xs
             </goals>
             <phase>pre-site</phase>
           </execution>
+          <execution>
+            <id>enforce-property</id>
+            <goals>
+              <goal>enforce</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <requireProperty>
+                  <property>hadoop.version</property>
+                  <message>You must set a hadoop.version to be the same as ${project.version}</message>
+                  <regex>${project.version}</regex>
+                  <regexMessage>The hadoop.version property should be set and should be ${project.version}.</regexMessage>
+                </requireProperty>
+              </rules>
+              <fail>true</fail>
+              </configuration>
+          </execution>
         </executions>
       </plugin>
       <plugin>
@@ -378,6 +406,8 @@ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xs
             <exclude>**/build/**</exclude>
             <exclude>**/patchprocess/**</exclude>
             <exclude>**/*.js</exclude>
+            <exclude>hadoop-hdds/**/</exclude>
+            <exclude>hadoop-ozone/**/</exclude>
          </excludes>
        </configuration>
       </plugin>
@@ -389,9 +419,6 @@ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xs
             <goals>
               <goal>attach-descriptor</goal>
             </goals>
-            <configuration>
-              <generateReports>true</generateReports>
-            </configuration>
           </execution>
         </executions>
       </plugin>
@@ -558,6 +585,62 @@ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xs
         </plugins>
       </build>
     </profile>
+    <profile>
+      <id>hdds-src</id>
+      <activation>
+        <activeByDefault>false</activeByDefault>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-assembly-plugin</artifactId>
+            <inherited>false</inherited>
+            <executions>
+              <execution>
+                <id>src-dist</id>
+                <phase>package</phase>
+                <goals>
+                  <goal>single</goal>
+                </goals>
+                <configuration>
+                  <appendAssemblyId>false</appendAssemblyId>
+                  <attach>false</attach>
+                  <finalName>hadoop-${project.version}-src-with-hdds</finalName>
+                  <outputDirectory>hadoop-dist/target</outputDirectory>
+                  <!-- Not using descriptorRef and hadoop-assembly dependency -->
+                  <!-- to avoid making hadoop-main to depend on a module      -->
+                  <descriptors>
+                    <descriptor>hadoop-assemblies/src/main/resources/assemblies/hadoop-src-with-hdds.xml</descriptor>
+                  </descriptors>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-antrun-plugin</artifactId>
+            <inherited>false</inherited>
+            <executions>
+              <execution>
+                <id>src-dist-msg</id>
+                <phase>package</phase>
+                <goals>
+                  <goal>run</goal>
+                </goals>
+                <configuration>
+                  <target>
+                    <echo/>
+                    <echo>Hadoop source tar (including HDDS) available at: ${basedir}/hadoop-dist/target/hadoop-${project.version}-src-with-hdds.tar.gz</echo>
+                    <echo/>
+                  </target>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
 
     <profile>
       <id>sign</id>
@@ -653,6 +736,16 @@ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xs
           </plugin>
         </plugins>
       </build>
+    </profile>
+    <profile>
+      <id>hdds</id>
+      <activation>
+        <activeByDefault>false</activeByDefault>
+      </activation>
+      <modules>
+        <module>hadoop-ozone</module>
+        <module>hadoop-hdds</module>
+      </modules>
     </profile>
   </profiles>
 </project>

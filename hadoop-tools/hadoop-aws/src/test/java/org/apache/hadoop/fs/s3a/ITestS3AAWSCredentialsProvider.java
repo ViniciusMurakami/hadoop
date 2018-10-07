@@ -33,9 +33,7 @@ import org.junit.rules.Timeout;
 
 import com.amazonaws.auth.AWSCredentials;
 import com.amazonaws.auth.AWSCredentialsProvider;
-import com.amazonaws.auth.AWSCredentialsProviderChain;
 import com.amazonaws.auth.BasicAWSCredentials;
-import com.amazonaws.auth.InstanceProfileCredentialsProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -140,24 +138,11 @@ public class ITestS3AAWSCredentialsProvider {
       createFailingFS(conf);
     } catch (AccessDeniedException e) {
       // expected
+    } catch (AWSServiceIOException e) {
+      GenericTestUtils.assertExceptionContains(
+          "UnrecognizedClientException", e);
+      // expected
     }
-  }
-
-  static class GoodCredentialsProvider extends AWSCredentialsProviderChain {
-
-    @SuppressWarnings("unused")
-    public GoodCredentialsProvider(Configuration conf) {
-      super(new BasicAWSCredentialsProvider(conf.get(ACCESS_KEY),
-          conf.get(SECRET_KEY)),
-          InstanceProfileCredentialsProvider.getInstance());
-    }
-  }
-
-  @Test
-  public void testGoodProvider() throws Exception {
-    Configuration conf = new Configuration();
-    conf.set(AWS_CREDENTIALS_PROVIDER, GoodCredentialsProvider.class.getName());
-    S3ATestUtils.createTestFileSystem(conf);
   }
 
   @Test
@@ -174,4 +159,5 @@ public class ITestS3AAWSCredentialsProvider {
     assertNotNull(stat);
     assertEquals(testFile, stat.getPath());
   }
+
 }

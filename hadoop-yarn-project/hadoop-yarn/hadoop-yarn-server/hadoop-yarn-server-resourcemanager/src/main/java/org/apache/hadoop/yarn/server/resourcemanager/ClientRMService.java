@@ -29,14 +29,17 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import org.apache.commons.cli.UnrecognizedOptionException;
-import org.apache.commons.lang.math.LongRange;
+import org.apache.commons.lang3.Range;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
@@ -65,8 +68,12 @@ import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationReportRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationReportResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationsRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetApplicationsResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAttributesToNodesRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAttributesToNodesResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterMetricsRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterMetricsResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetClusterNodeAttributesRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetClusterNodeAttributesResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterNodeLabelsRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterNodeLabelsResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetClusterNodesRequest;
@@ -83,6 +90,8 @@ import org.apache.hadoop.yarn.api.protocolrecords.GetNewApplicationRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNewApplicationResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNewReservationRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNewReservationResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetNodesToAttributesRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetNodesToAttributesResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNodesToLabelsRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.GetNodesToLabelsResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.GetQueueInfoRequest;
@@ -111,6 +120,12 @@ import org.apache.hadoop.yarn.api.protocolrecords.UpdateApplicationPriorityReque
 import org.apache.hadoop.yarn.api.protocolrecords.UpdateApplicationPriorityResponse;
 import org.apache.hadoop.yarn.api.protocolrecords.UpdateApplicationTimeoutsRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.UpdateApplicationTimeoutsResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAllResourceProfilesRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAllResourceProfilesResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAllResourceTypeInfoRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetAllResourceTypeInfoResponse;
+import org.apache.hadoop.yarn.api.protocolrecords.GetResourceProfileRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.GetResourceProfileResponse;
 import org.apache.hadoop.yarn.api.records.ApplicationAccessType;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptReport;
@@ -120,8 +135,12 @@ import org.apache.hadoop.yarn.api.records.ApplicationSubmissionContext;
 import org.apache.hadoop.yarn.api.records.ApplicationTimeoutType;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerReport;
+import org.apache.hadoop.yarn.api.records.NodeAttribute;
+import org.apache.hadoop.yarn.api.records.NodeAttributeKey;
+import org.apache.hadoop.yarn.api.records.NodeAttributeInfo;
 import org.apache.hadoop.yarn.api.records.NodeReport;
 import org.apache.hadoop.yarn.api.records.NodeState;
+import org.apache.hadoop.yarn.api.records.NodeToAttributeValue;
 import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.QueueACL;
 import org.apache.hadoop.yarn.api.records.QueueInfo;
@@ -141,9 +160,13 @@ import org.apache.hadoop.yarn.factories.RecordFactory;
 import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
 import org.apache.hadoop.yarn.ipc.RPCUtil;
 import org.apache.hadoop.yarn.ipc.YarnRPC;
+import org.apache.hadoop.yarn.nodelabels.AttributeValue;
+import org.apache.hadoop.yarn.nodelabels.NodeAttributesManager;
 import org.apache.hadoop.yarn.security.client.RMDelegationTokenIdentifier;
 import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
+import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.Keys;
 import org.apache.hadoop.yarn.server.resourcemanager.nodelabels.RMNodeLabelsManager;
+import org.apache.hadoop.yarn.server.resourcemanager.resource.ResourceProfilesManager;
 import org.apache.hadoop.yarn.server.resourcemanager.reservation.Plan;
 import org.apache.hadoop.yarn.server.resourcemanager.reservation.ReservationAllocation;
 import org.apache.hadoop.yarn.server.resourcemanager.reservation.ReservationInputValidator;
@@ -174,6 +197,7 @@ import org.apache.hadoop.yarn.util.Records;
 import org.apache.hadoop.yarn.util.UTCClock;
 
 import com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.yarn.util.resource.ResourceUtils;
 import org.apache.hadoop.yarn.util.timeline.TimelineUtils;
 
 
@@ -206,8 +230,12 @@ public class ClientRMService extends AbstractService implements
   private ReservationSystem reservationSystem;
   private ReservationInputValidator rValidator;
 
+  private boolean filterAppsByUser = false;
+
   private static final EnumSet<RMAppState> ACTIVE_APP_STATES = EnumSet.of(
       RMAppState.ACCEPTED, RMAppState.RUNNING);
+
+  private ResourceProfilesManager resourceProfilesManager;
 
   public ClientRMService(RMContext rmContext, YarnScheduler scheduler,
       RMAppManager rmAppManager, ApplicationACLsManager applicationACLsManager,
@@ -231,6 +259,7 @@ public class ClientRMService extends AbstractService implements
     this.reservationSystem = rmContext.getReservationSystem();
     this.clock = clock;
     this.rValidator = new ReservationInputValidator(clock);
+    resourceProfilesManager = rmContext.getResourceProfilesManager();
   }
 
   @Override
@@ -250,6 +279,10 @@ public class ClientRMService extends AbstractService implements
             conf.getInt(YarnConfiguration.RM_CLIENT_THREAD_COUNT, 
                 YarnConfiguration.DEFAULT_RM_CLIENT_THREAD_COUNT));
     
+    this.server.addTerseExceptions(ApplicationNotFoundException.class,
+        ApplicationAttemptNotFoundException.class,
+        ContainerNotFoundException.class);
+
     // Enable service authorization?
     if (conf.getBoolean(
         CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHORIZATION, 
@@ -263,7 +296,11 @@ public class ClientRMService extends AbstractService implements
       }
       refreshServiceAcls(conf, RMPolicyProvider.getInstance());
     }
-    
+
+    this.filterAppsByUser  = conf.getBoolean(
+        YarnConfiguration.FILTER_ENTITY_LIST_BY_USER,
+        YarnConfiguration.DEFAULT_DISPLAY_APPS_FOR_LOGGED_IN_USER);
+
     this.server.start();
     clientBindAddress = conf.updateConnectAddr(YarnConfiguration.RM_BIND_HOST,
                                                YarnConfiguration.RM_ADDRESS,
@@ -731,7 +768,7 @@ public class ClientRMService extends AbstractService implements
       message.append(" at ").append(remoteAddress.getHostAddress());
     }
 
-    String diagnostics = org.apache.commons.lang.StringUtils
+    String diagnostics = org.apache.commons.lang3.StringUtils
         .trimToNull(request.getDiagnostics());
     if (diagnostics != null) {
       message.append(" with diagnostic message: ");
@@ -765,21 +802,14 @@ public class ClientRMService extends AbstractService implements
     response.setClusterMetrics(ymetrics);
     return response;
   }
-  
-  @Override
-  public GetApplicationsResponse getApplications(
-      GetApplicationsRequest request) throws YarnException {
-    return getApplications(request, true);
-  }
 
   /**
    * Get applications matching the {@link GetApplicationsRequest}. If
    * caseSensitive is set to false, applicationTypes in
    * GetApplicationRequest are expected to be in all-lowercase
    */
-  @Private
-  public GetApplicationsResponse getApplications(
-      GetApplicationsRequest request, boolean caseSensitive)
+  @Override
+  public GetApplicationsResponse getApplications(GetApplicationsRequest request)
       throws YarnException {
     UserGroupInformation callerUGI;
     try {
@@ -789,15 +819,15 @@ public class ClientRMService extends AbstractService implements
       throw RPCUtil.getRemoteException(ie);
     }
 
-    Set<String> applicationTypes = request.getApplicationTypes();
+    Set<String> applicationTypes = getLowerCasedAppTypes(request);
     EnumSet<YarnApplicationState> applicationStates =
         request.getApplicationStates();
     Set<String> users = request.getUsers();
     Set<String> queues = request.getQueues();
     Set<String> tags = request.getApplicationTags();
     long limit = request.getLimit();
-    LongRange start = request.getStartRange();
-    LongRange finish = request.getFinishRange();
+    Range<Long> start = request.getStartRange();
+    Range<Long> finish = request.getFinishRange();
     ApplicationsRequestScope scope = request.getScope();
 
     final Map<ApplicationId, RMApp> apps = rmContext.getRMApps();
@@ -853,9 +883,8 @@ public class ClientRMService extends AbstractService implements
       }
 
       if (applicationTypes != null && !applicationTypes.isEmpty()) {
-        String appTypeToMatch = caseSensitive
-            ? application.getApplicationType()
-            : StringUtils.toLowerCase(application.getApplicationType());
+        String appTypeToMatch =
+            StringUtils.toLowerCase(application.getApplicationType());
         if (!applicationTypes.contains(appTypeToMatch)) {
           continue;
         }
@@ -873,11 +902,11 @@ public class ClientRMService extends AbstractService implements
         continue;
       }
 
-      if (start != null && !start.containsLong(application.getStartTime())) {
+      if (start != null && !start.contains(application.getStartTime())) {
         continue;
       }
 
-      if (finish != null && !finish.containsLong(application.getFinishTime())) {
+      if (finish != null && !finish.contains(application.getFinishTime())) {
         continue;
       }
 
@@ -905,14 +934,33 @@ public class ClientRMService extends AbstractService implements
         continue;
       }
 
+      // Given RM is configured to display apps per user, skip apps to which
+      // this caller doesn't have access to view.
+      if (filterAppsByUser && !allowAccess) {
+        continue;
+      }
+
       reports.add(application.createAndGetApplicationReport(
           callerUGI.getUserName(), allowAccess));
     }
 
+    RMAuditLogger.logSuccess(callerUGI.getUserName(),
+        AuditConstants.GET_APPLICATIONS_REQUEST, "ClientRMService");
     GetApplicationsResponse response =
       recordFactory.newRecordInstance(GetApplicationsResponse.class);
     response.setApplicationList(reports);
     return response;
+  }
+
+  private Set<String> getLowerCasedAppTypes(GetApplicationsRequest request) {
+    Set<String> applicationTypes = new HashSet<>();
+    if (request.getApplicationTypes() != null && !request.getApplicationTypes()
+        .isEmpty()) {
+      for (String type : request.getApplicationTypes()) {
+        applicationTypes.add(StringUtils.toLowerCase(type));
+      }
+    }
+    return applicationTypes;
   }
 
   @Override
@@ -948,6 +996,13 @@ public class ClientRMService extends AbstractService implements
 
     GetQueueInfoResponse response =
       recordFactory.newRecordInstance(GetQueueInfoResponse.class);
+    RMAuditLogger.ArgsBuilder arguments = new RMAuditLogger.ArgsBuilder()
+        .append(Keys.QUEUENAME, request.getQueueName())
+        .append(Keys.INCLUDEAPPS,
+            String.valueOf(request.getIncludeApplications()))
+        .append(Keys.INCLUDECHILDQUEUES,
+            String.valueOf(request.getIncludeChildQueues()))
+        .append(Keys.RECURSIVE, String.valueOf(request.getRecursive()));
     try {
       QueueInfo queueInfo = 
         scheduler.getQueueInfo(request.getQueueName(),  
@@ -974,14 +1029,20 @@ public class ClientRMService extends AbstractService implements
       }
       queueInfo.setApplications(appReports);
       response.setQueueInfo(queueInfo);
+      RMAuditLogger.logSuccess(callerUGI.getUserName(),
+          AuditConstants.GET_QUEUE_INFO_REQUEST,
+          "ClientRMService", arguments);
     } catch (IOException ioe) {
       LOG.info("Failed to getQueueInfo for " + request.getQueueName(), ioe);
+      RMAuditLogger.logFailure(callerUGI.getUserName(),
+          AuditConstants.GET_QUEUE_INFO_REQUEST, "UNKNOWN", "ClientRMService",
+          ioe.getMessage(), arguments);
     }
     
     return response;
   }
 
-  private NodeReport createNodeReports(RMNode rmNode) {    
+  private NodeReport createNodeReports(RMNode rmNode) {
     SchedulerNodeReport schedulerNodeReport = 
         scheduler.getNodeReport(rmNode.getNodeID());
     Resource used = BuilderUtils.newResource(0, 0);
@@ -989,15 +1050,17 @@ public class ClientRMService extends AbstractService implements
     if (schedulerNodeReport != null) {
       used = schedulerNodeReport.getUsedResource();
       numContainers = schedulerNodeReport.getNumContainers();
-    } 
+    }
 
+    Set<NodeAttribute> attrs = rmNode.getAllNodeAttributes();
     NodeReport report =
         BuilderUtils.newNodeReport(rmNode.getNodeID(), rmNode.getState(),
             rmNode.getHttpAddress(), rmNode.getRackName(), used,
             rmNode.getTotalCapability(), numContainers,
             rmNode.getHealthReport(), rmNode.getLastHealthReportTime(),
             rmNode.getNodeLabels(), rmNode.getAggregatedContainersUtilization(),
-            rmNode.getNodeUtilization());
+            rmNode.getNodeUtilization(), rmNode.getDecommissioningTimeout(),
+            null, attrs);
 
     return report;
   }
@@ -1687,6 +1750,7 @@ public class ClientRMService extends AbstractService implements
         RMAuditLogger.logSuccess(callerUGI.getShortUserName(),
             AuditConstants.UPDATE_APP_TIMEOUTS, "ClientRMService",
             applicationId);
+        response.setApplicationTimeouts(applicationTimeouts);
         return response;
       }
       String msg =
@@ -1698,7 +1762,8 @@ public class ClientRMService extends AbstractService implements
     }
 
     try {
-      rmAppManager.updateApplicationTimeout(application, applicationTimeouts);
+      applicationTimeouts = rmAppManager.updateApplicationTimeout(application,
+          applicationTimeouts);
     } catch (YarnException ex) {
       RMAuditLogger.logFailure(callerUGI.getShortUserName(),
           AuditConstants.UPDATE_APP_TIMEOUTS, "UNKNOWN", "ClientRMService",
@@ -1708,6 +1773,7 @@ public class ClientRMService extends AbstractService implements
 
     RMAuditLogger.logSuccess(callerUGI.getShortUserName(),
         AuditConstants.UPDATE_APP_TIMEOUTS, "ClientRMService", applicationId);
+    response.setApplicationTimeouts(applicationTimeouts);
     return response;
   }
 
@@ -1759,4 +1825,88 @@ public class ClientRMService extends AbstractService implements
     return application;
   }
 
+  @Override
+  public GetAllResourceProfilesResponse getResourceProfiles(
+      GetAllResourceProfilesRequest request) throws YarnException, IOException {
+    GetAllResourceProfilesResponse response =
+        GetAllResourceProfilesResponse.newInstance();
+    response.setResourceProfiles(resourceProfilesManager.getResourceProfiles());
+    return response;
+  }
+
+  @Override
+  public GetResourceProfileResponse getResourceProfile(
+      GetResourceProfileRequest request) throws YarnException, IOException {
+    GetResourceProfileResponse response =
+        GetResourceProfileResponse.newInstance();
+    response.setResource(
+        resourceProfilesManager.getProfile(request.getProfileName()));
+    return response;
+  }
+
+  @Override
+  public GetAllResourceTypeInfoResponse getResourceTypeInfo(
+      GetAllResourceTypeInfoRequest request) throws YarnException, IOException {
+    GetAllResourceTypeInfoResponse response =
+        GetAllResourceTypeInfoResponse.newInstance();
+    response.setResourceTypeInfo(ResourceUtils.getResourcesTypeInfo());
+    return response;
+  }
+
+  @Override
+  public GetAttributesToNodesResponse getAttributesToNodes(
+      GetAttributesToNodesRequest request) throws YarnException, IOException {
+    NodeAttributesManager attributesManager =
+        rmContext.getNodeAttributesManager();
+    Map<NodeAttributeKey, List<NodeToAttributeValue>> attrToNodesWithStrVal =
+        new HashMap<>();
+    Map<NodeAttributeKey, Map<String, AttributeValue>> attributesToNodes =
+        attributesManager.getAttributesToNodes(request.getNodeAttributes());
+    for (Map.Entry<NodeAttributeKey, Map<String, AttributeValue>> attrib :
+          attributesToNodes.entrySet()) {
+      Map<String, AttributeValue> nodesToVal = attrib.getValue();
+      List<NodeToAttributeValue> nodeToAttrValList = new ArrayList<>();
+      for (Map.Entry<String, AttributeValue> nodeToVal : nodesToVal
+          .entrySet()) {
+        nodeToAttrValList.add(NodeToAttributeValue
+            .newInstance(nodeToVal.getKey(), nodeToVal.getValue().getValue()));
+      }
+      attrToNodesWithStrVal.put(attrib.getKey(), nodeToAttrValList);
+    }
+    GetAttributesToNodesResponse response =
+        GetAttributesToNodesResponse.newInstance(attrToNodesWithStrVal);
+    return response;
+  }
+
+  @Override
+  public GetClusterNodeAttributesResponse getClusterNodeAttributes(
+      GetClusterNodeAttributesRequest request)
+      throws YarnException, IOException {
+    NodeAttributesManager attributesManager =
+        rmContext.getNodeAttributesManager();
+    Set<NodeAttribute> attributes =
+        attributesManager.getClusterNodeAttributes(null);
+
+    GetClusterNodeAttributesResponse response =
+        GetClusterNodeAttributesResponse.newInstance(
+            attributes.stream().map(attr -> NodeAttributeInfo.newInstance(attr))
+                .collect(Collectors.toSet()));
+    return response;
+  }
+
+  @Override
+  public GetNodesToAttributesResponse getNodesToAttributes(
+      GetNodesToAttributesRequest request) throws YarnException, IOException {
+    NodeAttributesManager attributesManager =
+        rmContext.getNodeAttributesManager();
+    GetNodesToAttributesResponse response = GetNodesToAttributesResponse
+        .newInstance(
+            attributesManager.getNodesToAttributes(request.getHostNames()));
+    return response;
+  }
+
+  @VisibleForTesting
+  public void setDisplayPerUserApps(boolean displayPerUserApps) {
+    this.filterAppsByUser = displayPerUserApps;
+  }
 }

@@ -26,19 +26,20 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.classification.InterfaceStability.Unstable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.service.CompositeService;
+import org.apache.hadoop.yarn.api.records.timelineservice.TimelineDomain;
 import org.apache.hadoop.yarn.api.records.timelineservice.TimelineMetricOperation;
 import org.apache.hadoop.yarn.api.records.timelineservice.TimelineEntities;
 import org.apache.hadoop.yarn.api.records.timelineservice.TimelineEntity;
 import org.apache.hadoop.yarn.api.records.timelineservice.TimelineMetric;
 import org.apache.hadoop.yarn.api.records.timelineservice.TimelineWriteResponse;
 import org.apache.hadoop.yarn.server.timelineservice.storage.TimelineWriter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Service that handles writes to the timeline service and writes them to the
@@ -51,7 +52,8 @@ import org.apache.hadoop.yarn.server.timelineservice.storage.TimelineWriter;
 @Unstable
 public abstract class TimelineCollector extends CompositeService {
 
-  private static final Log LOG = LogFactory.getLog(TimelineCollector.class);
+  private static final Logger LOG =
+      LoggerFactory.getLogger(TimelineCollector.class);
   public static final String SEPARATOR = "_";
 
   private TimelineWriter writer;
@@ -61,6 +63,8 @@ public abstract class TimelineCollector extends CompositeService {
       = new HashSet<>();
 
   private volatile boolean readyToAggregate = false;
+
+  private volatile boolean isStopped = false;
 
   public TimelineCollector(String name) {
     super(name);
@@ -78,7 +82,12 @@ public abstract class TimelineCollector extends CompositeService {
 
   @Override
   protected void serviceStop() throws Exception {
+    isStopped = true;
     super.serviceStop();
+  }
+
+  boolean isStopped() {
+    return isStopped;
   }
 
   protected void setWriter(TimelineWriter w) {
@@ -138,7 +147,34 @@ public abstract class TimelineCollector extends CompositeService {
     // flush the writer buffer concurrently and swallow any exception
     // caused by the timeline enitites that are being put here.
     synchronized (writer) {
-      response = writeTimelineEntities(entities);
+      response = writeTimelineEntities(entities, callerUgi);
+      flushBufferedTimelineEntities();
+    }
+
+    return response;
+  }
+
+  /**
+   * Add or update an domain. If the domain already exists, only the owner
+   * and the admin can update it.
+   *
+   * @param domain    domain to post
+   * @param callerUgi the caller UGI
+   * @return the response that contains the result of the post.
+   * @throws IOException if there is any exception encountered while putting
+   *                     domain.
+   */
+  public TimelineWriteResponse putDomain(TimelineDomain domain,
+      UserGroupInformation callerUgi) throws IOException {
+    if (LOG.isDebugEnabled()) {
+      LOG.debug(
+          "putDomain(domain=" + domain + ", callerUgi=" + callerUgi + ")");
+    }
+
+    TimelineWriteResponse response;
+    synchronized (writer) {
+      final TimelineCollectorContext context = getTimelineEntityContext();
+      response = writer.write(context, domain);
       flushBufferedTimelineEntities();
     }
 
@@ -146,15 +182,14 @@ public abstract class TimelineCollector extends CompositeService {
   }
 
   private TimelineWriteResponse writeTimelineEntities(
-      TimelineEntities entities) throws IOException {
+      TimelineEntities entities, UserGroupInformation callerUgi)
+      throws IOException {
     // Update application metrics for aggregation
     updateAggregateStatus(entities, aggregationGroups,
         getEntityTypesSkipAggregation());
 
     final TimelineCollectorContext context = getTimelineEntityContext();
-    return writer.write(context.getClusterId(), context.getUserId(),
-        context.getFlowName(), context.getFlowVersion(),
-        context.getFlowRunId(), context.getAppId(), entities);
+    return writer.write(context, entities, callerUgi);
   }
 
   /**
@@ -186,7 +221,7 @@ public abstract class TimelineCollector extends CompositeService {
           callerUgi + ")");
     }
 
-    writeTimelineEntities(entities);
+    writeTimelineEntities(entities, callerUgi);
   }
 
   /**

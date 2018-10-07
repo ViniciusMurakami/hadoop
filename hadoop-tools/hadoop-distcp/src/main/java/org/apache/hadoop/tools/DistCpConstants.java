@@ -18,12 +18,19 @@
 
 package org.apache.hadoop.tools;
 
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.fs.Path;
 
 /**
  * Utility class to hold commonly used constants.
  */
-public class DistCpConstants {
+@InterfaceAudience.LimitedPrivate("Distcp support tools")
+@InterfaceStability.Evolving
+public final class DistCpConstants {
+
+  private DistCpConstants() {
+  }
 
   /* Default number of threads to use for building file listing */
   public static final int DEFAULT_LISTSTATUS_THREADS = 1;
@@ -45,12 +52,15 @@ public class DistCpConstants {
   public static final String CONF_LABEL_ATOMIC_COPY = "distcp.atomic.copy";
   public static final String CONF_LABEL_WORK_PATH = "distcp.work.path";
   public static final String CONF_LABEL_LOG_PATH = "distcp.log.path";
+  public static final String CONF_LABEL_VERBOSE_LOG = "distcp.verbose.log";
   public static final String CONF_LABEL_IGNORE_FAILURES = "distcp.ignore.failures";
   public static final String CONF_LABEL_PRESERVE_STATUS = "distcp.preserve.status";
   public static final String CONF_LABEL_PRESERVE_RAWXATTRS =
       "distcp.preserve.rawxattrs";
   public static final String CONF_LABEL_SYNC_FOLDERS = "distcp.sync.folders";
   public static final String CONF_LABEL_DELETE_MISSING = "distcp.delete.missing.source";
+  public static final String CONF_LABEL_TRACK_MISSING =
+      "distcp.track.missing.source";
   public static final String CONF_LABEL_LISTSTATUS_THREADS = "distcp.liststatus.threads";
   public static final String CONF_LABEL_MAX_MAPS = "distcp.max.maps";
   public static final String CONF_LABEL_SOURCE_LISTING = "distcp.source.listing";
@@ -147,4 +157,13 @@ public class DistCpConstants {
   static final String HDFS_DISTCP_DIFF_DIRECTORY_NAME = ".distcp.diff.tmp";
 
   public static final int COPY_BUFFER_SIZE_DEFAULT = 8 * 1024;
+
+  /** Filename of sorted files in when tracking saves them. */
+  public static final String SOURCE_SORTED_FILE = "source_sorted.seq";
+
+  /** Filename of unsorted target listing. */
+  public static final String TARGET_LISTING_FILE = "target_listing.seq";
+
+  /** Filename of sorted target listing. */
+  public static final String TARGET_SORTED_FILE = "target_sorted.seq";
 }

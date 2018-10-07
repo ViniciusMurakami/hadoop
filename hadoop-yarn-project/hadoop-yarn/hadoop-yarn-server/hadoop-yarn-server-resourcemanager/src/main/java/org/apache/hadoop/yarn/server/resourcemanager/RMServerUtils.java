@@ -32,6 +32,7 @@ import java.util.Set;
 
 import com.google.common.collect.Sets;
 import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -88,13 +89,15 @@ import org.apache.hadoop.yarn.util.resource.Resources;
  */
 public class RMServerUtils {
 
+  private static final Log LOG_HANDLE = LogFactory.getLog(RMServerUtils.class);
+
   public static final String UPDATE_OUTSTANDING_ERROR =
       "UPDATE_OUTSTANDING_ERROR";
   private static final String INCORRECT_CONTAINER_VERSION_ERROR =
       "INCORRECT_CONTAINER_VERSION_ERROR";
   private static final String INVALID_CONTAINER_ID =
       "INVALID_CONTAINER_ID";
-  private static final String RESOURCE_OUTSIDE_ALLOWED_RANGE =
+  public static final String RESOURCE_OUTSIDE_ALLOWED_RANGE =
       "RESOURCE_OUTSIDE_ALLOWED_RANGE";
 
   protected static final RecordFactory RECORD_FACTORY =
@@ -232,18 +235,19 @@ public class RMServerUtils {
    * requested memory/vcore is non-negative and not greater than max
    */
   public static void normalizeAndValidateRequests(List<ResourceRequest> ask,
-      Resource maximumResource, String queueName, YarnScheduler scheduler,
-      RMContext rmContext)
-      throws InvalidResourceRequestException {
+      Resource maximumAllocation, String queueName, YarnScheduler scheduler,
+      RMContext rmContext) throws InvalidResourceRequestException {
     // Get queue from scheduler
     QueueInfo queueInfo = null;
     try {
       queueInfo = scheduler.getQueueInfo(queueName, false, false);
     } catch (IOException e) {
+      //Queue may not exist since it could be auto-created in case of
+      // dynamic queues
     }
 
     for (ResourceRequest resReq : ask) {
-      SchedulerUtils.normalizeAndvalidateRequest(resReq, maximumResource,
+      SchedulerUtils.normalizeAndValidateRequest(resReq, maximumAllocation,
           queueName, scheduler, rmContext, queueInfo);
     }
   }
@@ -295,8 +299,7 @@ public class RMServerUtils {
     // Target resource of the increase request is more than NM can offer
     ResourceScheduler scheduler = rmContext.getScheduler();
     RMNode rmNode = request.getSchedulerNode().getRMNode();
-    if (!Resources.fitsIn(scheduler.getResourceCalculator(),
-        scheduler.getClusterResource(), targetResource,
+    if (!Resources.fitsIn(scheduler.getResourceCalculator(), targetResource,
         rmNode.getTotalCapability())) {
       String msg = "Target resource=" + targetResource + " of containerId="
           + containerId + " is more than node's total resource="
@@ -335,7 +338,8 @@ public class RMServerUtils {
       return false;
     }
     ResourceScheduler scheduler = rmContext.getScheduler();
-    request.setCapability(scheduler.getNormalizedResource(request.getCapability()));
+    request.setCapability(scheduler
+        .getNormalizedResource(request.getCapability(), maximumAllocation));
     return true;
   }
 
@@ -478,7 +482,7 @@ public class RMServerUtils {
       DUMMY_APPLICATION_RESOURCE_USAGE_REPORT =
       BuilderUtils.newApplicationResourceUsageReport(-1, -1,
           Resources.createResource(-1, -1), Resources.createResource(-1, -1),
-          Resources.createResource(-1, -1), 0, 0, 0, 0);
+          Resources.createResource(-1, -1), new HashMap<>(), new HashMap<>());
 
 
   /**
@@ -621,5 +625,13 @@ public class RMServerUtils {
               Collections.singleton(label));
       return labelsToNodes.get(label);
     }
+  }
+
+  public static Long getOrDefault(Map<String, Long> map, String key,
+      Long defaultValue) {
+    if (map.containsKey(key)) {
+      return map.get(key);
+    }
+    return defaultValue;
   }
 }

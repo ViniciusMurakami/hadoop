@@ -33,6 +33,11 @@ public final class AdlConfKeys {
   public static final String AZURE_AD_REFRESH_URL_KEY =
       "fs.adl.oauth2.refresh.url";
 
+  public static final String AZURE_AD_ACCOUNT_PREFIX =
+          "fs.adl.account.";
+  public static final String AZURE_AD_PREFIX =
+          "fs.adl.";
+
   // optional when provider type is refresh or client id.
   public static final String AZURE_AD_TOKEN_PROVIDER_CLASS_KEY =
       "fs.adl.oauth2.access.token.provider";
@@ -53,6 +58,13 @@ public final class AdlConfKeys {
       "fs.adl.oauth2.credential";
   public static final String TOKEN_PROVIDER_TYPE_CLIENT_CRED =
       "ClientCredential";
+
+  // MSI Auth Configuration
+  public static final String MSI_PORT = "fs.adl.oauth2.msi.port";
+
+  // DeviceCode Auth configuration
+  public static final String DEVICE_CODE_CLIENT_APP_ID =
+      "fs.adl.oauth2.devicecode.clientapp.id";
 
   public static final String READ_AHEAD_BUFFER_SIZE_KEY =
       "adl.feature.client.cache.readahead";
@@ -93,6 +105,7 @@ public final class AdlConfKeys {
   static final String ADL_ENABLEUPN_FOR_OWNERGROUP_KEY =
       "adl.feature.ownerandgroup.enableupn";
   static final boolean ADL_ENABLEUPN_FOR_OWNERGROUP_DEFAULT = false;
+  public static final String ADL_HTTP_TIMEOUT = "adl.http.timeout";
 
   public static void addDeprecatedKeys() {
     Configuration.addDeprecations(new DeprecationDelta[]{

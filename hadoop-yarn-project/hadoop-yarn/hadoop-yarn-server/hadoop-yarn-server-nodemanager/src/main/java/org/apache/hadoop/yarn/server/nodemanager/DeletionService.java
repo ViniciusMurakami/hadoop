@@ -20,10 +20,13 @@ package org.apache.hadoop.yarn.server.nodemanager;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 
+import org.apache.hadoop.yarn.server.nodemanager.recovery.RecoveryIterator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -31,8 +34,6 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.service.AbstractService;
@@ -49,7 +50,8 @@ import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
 public class DeletionService extends AbstractService {
 
-  private static final Log LOG = LogFactory.getLog(DeletionService.class);
+  private static final Logger LOG =
+       LoggerFactory.getLogger(DeletionService.class);
 
   private int debugDelay;
   private final ContainerExecutor containerExecutor;
@@ -95,16 +97,20 @@ public class DeletionService extends AbstractService {
 
   private void recover(NMStateStoreService.RecoveredDeletionServiceState state)
       throws IOException {
-    List<DeletionServiceDeleteTaskProto> taskProtos = state.getTasks();
     Map<Integer, DeletionTaskRecoveryInfo> idToInfoMap =
-        new HashMap<>(taskProtos.size());
-    Set<Integer> successorTasks = new HashSet<>();
-    for (DeletionServiceDeleteTaskProto proto : taskProtos) {
-      DeletionTaskRecoveryInfo info =
-          NMProtoUtils.convertProtoToDeletionTaskRecoveryInfo(proto, this);
-      idToInfoMap.put(info.getTask().getTaskId(), info);
-      nextTaskId.set(Math.max(nextTaskId.get(), info.getTask().getTaskId()));
-      successorTasks.addAll(info.getSuccessorTaskIds());
+        new HashMap<Integer, DeletionTaskRecoveryInfo>();
+    Set<Integer> successorTasks = new HashSet<Integer>();
+
+    try (RecoveryIterator<DeletionServiceDeleteTaskProto> it =
+             state.getIterator()) {
+      while (it.hasNext()) {
+        DeletionServiceDeleteTaskProto proto = it.next();
+        DeletionTaskRecoveryInfo info =
+            NMProtoUtils.convertProtoToDeletionTaskRecoveryInfo(proto, this);
+        idToInfoMap.put(info.getTask().getTaskId(), info);
+        nextTaskId.set(Math.max(nextTaskId.get(), info.getTask().getTaskId()));
+        successorTasks.addAll(info.getSuccessorTaskIds());
+      }
     }
 
     // restore the task dependencies and schedule the deletion tasks that

@@ -22,8 +22,8 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.hdfs.client.HdfsDataOutputStream;
 import org.apache.hadoop.nfs.nfs3.FileHandle;
 import org.apache.hadoop.nfs.nfs3.Nfs3Constant.WriteStableHow;
@@ -37,7 +37,7 @@ import com.google.common.base.Preconditions;
  * xid and reply status.
  */
 class WriteCtx {
-  public static final Log LOG = LogFactory.getLog(WriteCtx.class);
+  public static final Logger LOG = LoggerFactory.getLogger(WriteCtx.class);
   
   /**
    * In memory write data has 3 states. ALLOW_DUMP: not sequential write, still
@@ -318,9 +318,9 @@ class WriteCtx {
   
   @Override
   public String toString() {
-    return "Id:" + handle.getFileId() + " offset:" + getPlainOffset() + " " +
-        "count:" + count + " originalCount:" + getOriginalCount() +
-        " stableHow:" + stableHow + " replied:" + replied + " dataState:" +
-        dataState + " xid:" + xid;
+    return "FileHandle:" + handle.dumpFileHandle() + " offset:"
+        + getPlainOffset() + " " + "count:" + count + " originalCount:"
+        + getOriginalCount() + " stableHow:" + stableHow + " replied:"
+        + replied + " dataState:" + dataState + " xid:" + xid;
   }
 }

@@ -42,9 +42,9 @@ import java.util.Map.Entry;
 import java.util.Properties;
 import java.util.Set;
 
-import org.apache.commons.lang.StringUtils;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileUtil;
 import org.apache.hadoop.fs.permission.FsPermission;
@@ -75,7 +75,8 @@ import com.google.common.io.Files;
  */
 public abstract class FSImageTestUtil {
   
-  public static final Log LOG = LogFactory.getLog(FSImageTestUtil.class);
+  public static final Logger LOG =
+      LoggerFactory.getLogger(FSImageTestUtil.class);
   
   /**
    * The position in the fsimage header where the txid is
@@ -108,6 +109,8 @@ public abstract class FSImageTestUtil {
       try {
         raf.seek(IMAGE_TXID_POS);
         raf.writeLong(0);
+        raf.close();
+        raf = null;
       } finally {
         IOUtils.closeStream(raf);
       }
@@ -542,9 +545,12 @@ public abstract class FSImageTestUtil {
       
       out = new FileOutputStream(versionFile);
       props.store(out, null);
+      out.close();
+      out = null;
       
     } finally {
-      IOUtils.cleanup(null, fis, out);
+      IOUtils.closeStream(fis);
+      IOUtils.closeStream(out);
     }    
   }
 
@@ -557,15 +563,15 @@ public abstract class FSImageTestUtil {
     assertNotNull(image);
   }
 
-  public static void logStorageContents(Log LOG, NNStorage storage) {
-    LOG.info("current storages and corresponding sizes:");
+  public static void logStorageContents(Logger log, NNStorage storage) {
+    log.info("current storages and corresponding sizes:");
     for (StorageDirectory sd : storage.dirIterable(null)) {
       File curDir = sd.getCurrentDir();
-      LOG.info("In directory " + curDir);
+      log.info("In directory " + curDir);
       File[] files = curDir.listFiles();
       Arrays.sort(files);
       for (File f : files) {
-        LOG.info("  file " + f.getAbsolutePath() + "; len = " + f.length());  
+        log.info("  file " + f.getAbsolutePath() + "; len = " + f.length());
       }
     }
   }

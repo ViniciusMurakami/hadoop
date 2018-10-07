@@ -54,8 +54,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.apache.commons.io.FileUtils;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.ChecksumException;
 import org.apache.hadoop.fs.FileSystem;
@@ -130,7 +130,7 @@ public class TestEditLog {
 
   /**
    * A garbage mkdir op which is used for testing
-   * {@link EditLogFileInputStream#scanEditLog(File)}
+   * {@link EditLogFileInputStream#scanEditLog(File, long, boolean)}
    */
   public static class GarbageMkdirOp extends FSEditLogOp {
     public GarbageMkdirOp() {
@@ -168,7 +168,7 @@ public class TestEditLog {
     }
   }
 
-  static final Log LOG = LogFactory.getLog(TestEditLog.class);
+  static final Logger LOG = LoggerFactory.getLogger(TestEditLog.class);
   
   static final int NUM_DATA_NODES = 0;
 
@@ -288,7 +288,8 @@ public class TestEditLog {
       long numEdits = testLoad(HADOOP20_SOME_EDITS, namesystem);
       assertEquals(3, numEdits);
       // Sanity check the edit
-      HdfsFileStatus fileInfo = namesystem.getFileInfo("/myfile", false);
+      HdfsFileStatus fileInfo =
+          namesystem.getFileInfo("/myfile", false, false, false);
       assertEquals("supergroup", fileInfo.getGroup());
       assertEquals(3, fileInfo.getReplication());
     } finally {
@@ -1141,7 +1142,7 @@ public class TestEditLog {
     /**
      * Construct the failure specification. 
      * @param roll number to fail after. e.g. 1 to fail after the first roll
-     * @param loginfo index of journal to fail. 
+     * @param logindex index of journal to fail.
      */
     AbortSpec(int roll, int logindex) {
       this.roll = roll;
@@ -1595,7 +1596,7 @@ public class TestEditLog {
       fileSys.create(file2).close();
 
       // Restart and assert the above stated expectations.
-      IOUtils.cleanup(LOG, fileSys);
+      IOUtils.cleanupWithLogger(LOG, fileSys);
       cluster.restartNameNode();
       fileSys = cluster.getFileSystem();
       assertFalse(fileSys.getAclStatus(dir1).getEntries().isEmpty());
@@ -1604,7 +1605,7 @@ public class TestEditLog {
       assertTrue(fileSys.getAclStatus(dir3).getEntries().isEmpty());
       assertTrue(fileSys.getAclStatus(file2).getEntries().isEmpty());
     } finally {
-      IOUtils.cleanup(LOG, fileSys);
+      IOUtils.cleanupWithLogger(LOG, fileSys);
       if (cluster != null) {
         cluster.shutdown();
       }

@@ -21,12 +21,15 @@ package org.apache.hadoop.fs.azure;
 import com.microsoft.azure.storage.*;
 import com.microsoft.azure.storage.blob.*;
 import com.microsoft.azure.storage.core.Base64;
-import org.apache.commons.configuration2.SubsetConfiguration;
+import org.junit.Assert;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.commons.configuration2.SubsetConfiguration;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.azure.integration.AzureTestConstants;
 import org.apache.hadoop.fs.azure.metrics.AzureFileSystemInstrumentation;
 import org.apache.hadoop.fs.azure.metrics.AzureFileSystemMetricsSystem;
 import org.apache.hadoop.metrics2.AbstractMetric;
@@ -35,6 +38,8 @@ import org.apache.hadoop.metrics2.MetricsSink;
 import org.apache.hadoop.metrics2.MetricsTag;
 import org.apache.hadoop.metrics2.impl.TestMetricsConfig;
 
+import java.io.File;
+import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.*;
@@ -43,21 +48,25 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import static org.apache.hadoop.fs.azure.AzureNativeFileSystemStore.DEFAULT_STORAGE_EMULATOR_ACCOUNT_NAME;
 import static org.apache.hadoop.fs.azure.AzureNativeFileSystemStore.KEY_USE_LOCAL_SAS_KEY_MODE;
 import static org.apache.hadoop.fs.azure.AzureNativeFileSystemStore.KEY_USE_SECURE_MODE;
+import static org.apache.hadoop.fs.azure.integration.AzureTestUtils.verifyWasbAccountNameInConfig;
 
 /**
  * Helper class to create WASB file systems backed by either a mock in-memory
- * implementation or a real Azure Storage account. See RunningLiveWasbTests.txt
- * for instructions on how to connect to a real Azure Storage account.
+ * implementation or a real Azure Storage account.
  */
-public final class AzureBlobStorageTestAccount {
+public final class AzureBlobStorageTestAccount implements AutoCloseable,
+    AzureTestConstants {
   private static final Logger LOG = LoggerFactory.getLogger(
       AzureBlobStorageTestAccount.class);
 
-  private static final String ACCOUNT_KEY_PROPERTY_NAME = "fs.azure.account.key.";
   private static final String SAS_PROPERTY_NAME = "fs.azure.sas.";
   private static final String TEST_CONFIGURATION_FILE_NAME = "azure-test.xml";
-  private static final String TEST_ACCOUNT_NAME_PROPERTY_NAME = "fs.azure.test.account.name";
+  public static final String ACCOUNT_KEY_PROPERTY_NAME = "fs.azure.account.key.";
+  public static final String TEST_ACCOUNT_NAME_PROPERTY_NAME = "fs.azure.account.name";
+  public static final String WASB_TEST_ACCOUNT_NAME_WITH_DOMAIN = "fs.azure.wasb.account.name";
   public static final String MOCK_ACCOUNT_NAME = "mockAccount.blob.core.windows.net";
+  public static final String WASB_ACCOUNT_NAME_DOMAIN_SUFFIX = ".blob.core.windows.net";
+  public static final String WASB_ACCOUNT_NAME_DOMAIN_SUFFIX_REGEX = "\\.blob(\\.preprod)?\\.core\\.windows\\.net";
   public static final String MOCK_CONTAINER_NAME = "mockContainer";
   public static final String WASB_AUTHORITY_DELIMITER = "@";
   public static final String WASB_SCHEME = "wasb";
@@ -166,6 +175,7 @@ public final class AzureBlobStorageTestAccount {
     return new Path("/" + DEFAULT_PAGE_BLOB_DIRECTORY);
   }
 
+  @Deprecated
   public static Path pageBlobPath(String fileName) {
     return new Path(pageBlobPath(), fileName);
   }
@@ -201,6 +211,9 @@ public final class AzureBlobStorageTestAccount {
    * @return
    */
   private boolean wasGeneratedByMe(MetricsRecord currentRecord) {
+    Assert.assertNotNull("null filesystem", fs);
+    Assert.assertNotNull("null filesystemn instance ID",
+        fs.getInstrumentation().getFileSystemInstanceId());
     String myFsId = fs.getInstrumentation().getFileSystemInstanceId().toString();
     for (MetricsTag currentTag : currentRecord.tags()) {
       if (currentTag.name().equalsIgnoreCase("wasbFileSystemId")) {
@@ -247,13 +260,16 @@ public final class AzureBlobStorageTestAccount {
     getBlobReference(blobKey).releaseLease(accessCondition);
   }
 
-  private static void saveMetricsConfigFile() {
+  private static void saveMetricsConfigFile() throws IOException {
     if (!metricsConfigSaved) {
+      String testFilename = TestMetricsConfig.getTestFilename(
+          "hadoop-metrics2-azure-file-system");
+      File dest = new File(testFilename).getCanonicalFile();
+      dest.getParentFile().mkdirs();
       new org.apache.hadoop.metrics2.impl.ConfigBuilder()
       .add("azure-file-system.sink.azuretestcollector.class",
           StandardCollector.class.getName())
-      .save(TestMetricsConfig.getTestFilename(
-          "hadoop-metrics2-azure-file-system.properties"));
+      .save(testFilename);
       metricsConfigSaved = true;
     }
   }
@@ -314,9 +330,8 @@ public final class AzureBlobStorageTestAccount {
     Configuration conf = createTestConfiguration();
     if (!conf.getBoolean(USE_EMULATOR_PROPERTY_NAME, false)) {
       // Not configured to test against the storage emulator.
-      LOG.warn("Skipping emulator Azure test because configuration doesn't "
-          + "indicate that it's running. Please see RunningLiveWasbTests.txt "
-          + "for guidance.");
+      LOG.warn("Skipping emulator Azure test because configuration "
+          + "doesn't indicate that it's running.");
       return null;
     }
     CloudStorageAccount account =
@@ -368,7 +383,7 @@ public final class AzureBlobStorageTestAccount {
         containerName);
     container.create();
 
-    String accountName = conf.get(TEST_ACCOUNT_NAME_PROPERTY_NAME);
+    String accountName = verifyWasbAccountNameInConfig(conf);
 
     // Ensure that custom throttling is disabled and tolerate concurrent
     // out-of-band appends.
@@ -482,8 +497,7 @@ public final class AzureBlobStorageTestAccount {
         credentials = StorageCredentialsAnonymous.ANONYMOUS;
       } else {
         LOG.warn("Skipping live Azure test because of missing key for"
-            + " account '" + accountName + "'. "
-            + "Please see RunningLiveWasbTests.txt for guidance.");
+            + " account '" + accountName + "'.");
         return null;
       }
     } else {
@@ -515,10 +529,9 @@ public final class AzureBlobStorageTestAccount {
 
   static CloudStorageAccount createTestAccount(Configuration conf)
       throws URISyntaxException, KeyProviderException {
-    String testAccountName = conf.get(TEST_ACCOUNT_NAME_PROPERTY_NAME);
+    String testAccountName = verifyWasbAccountNameInConfig(conf);
     if (testAccountName == null) {
-      LOG.warn("Skipping live Azure test because of missing test account. "
-          + "Please see RunningLiveWasbTests.txt for guidance.");
+      LOG.warn("Skipping live Azure test because of missing test account");
       return null;
     }
     return createStorageAccount(testAccountName, conf, false);
@@ -561,16 +574,16 @@ public final class AzureBlobStorageTestAccount {
     String containerName = useContainerSuffixAsContainerName
         ? containerNameSuffix
         : String.format(
-            "wasbtests-%s-%tQ%s",
+            "wasbtests-%s-%s%s",
             System.getProperty("user.name"),
-            new Date(),
+            UUID.randomUUID().toString(),
             containerNameSuffix);
     container = account.createCloudBlobClient().getContainerReference(
         containerName);
     if (createOptions.contains(CreateOptions.CreateContainer)) {
       container.createIfNotExists();
     }
-    String accountName = conf.get(TEST_ACCOUNT_NAME_PROPERTY_NAME);
+    String accountName = verifyWasbAccountNameInConfig(conf);
     if (createOptions.contains(CreateOptions.UseSas)) {
       String sas = generateSAS(container,
           createOptions.contains(CreateOptions.Readonly));
@@ -732,7 +745,7 @@ public final class AzureBlobStorageTestAccount {
     CloudBlobClient blobClient = account.createCloudBlobClient();
 
     // Capture the account URL and the account name.
-    String accountName = conf.get(TEST_ACCOUNT_NAME_PROPERTY_NAME);
+    String accountName = verifyWasbAccountNameInConfig(conf);
 
     configureSecureModeTestSettings(conf);
 
@@ -805,7 +818,7 @@ public final class AzureBlobStorageTestAccount {
     CloudBlobClient blobClient = account.createCloudBlobClient();
 
     // Capture the account URL and the account name.
-    String accountName = conf.get(TEST_ACCOUNT_NAME_PROPERTY_NAME);
+    String accountName = verifyWasbAccountNameInConfig(conf);
 
     configureSecureModeTestSettings(conf);
 
@@ -861,6 +874,11 @@ public final class AzureBlobStorageTestAccount {
       blob.delete();
       blob = null;
     }
+  }
+
+  @Override
+  public void close() throws Exception {
+    cleanup();
   }
 
   public NativeAzureFileSystem getFileSystem() {

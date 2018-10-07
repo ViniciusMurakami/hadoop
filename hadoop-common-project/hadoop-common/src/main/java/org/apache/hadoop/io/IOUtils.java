@@ -19,6 +19,7 @@
 package org.apache.hadoop.io;
 
 import java.io.*;
+import java.lang.reflect.Constructor;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -32,13 +33,13 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.PathIOException;
 import org.apache.hadoop.util.Shell;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.IO_FILE_BUFFER_SIZE_DEFAULT;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.IO_FILE_BUFFER_SIZE_KEY;
@@ -49,7 +50,7 @@ import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.IO_FILE_BUFFER_
 @InterfaceAudience.Public
 @InterfaceStability.Evolving
 public class IOUtils {
-  public static final Log LOG = LogFactory.getLog(IOUtils.class);
+  public static final Logger LOG = LoggerFactory.getLogger(IOUtils.class);
 
   /**
    * Copies from one stream to another.
@@ -294,10 +295,22 @@ public class IOUtils {
    */
   public static void closeStream(java.io.Closeable stream) {
     if (stream != null) {
-      cleanup(null, stream);
+      cleanupWithLogger(null, stream);
     }
   }
-  
+
+  /**
+   * Closes the streams ignoring {@link Throwable}.
+   * Must only be called in cleaning up from exception handlers.
+   *
+   * @param streams the Streams to close
+   */
+  public static void closeStreams(java.io.Closeable... streams) {
+    if (streams != null) {
+      cleanupWithLogger(null, streams);
+    }
+  }
+
   /**
    * Closes the socket ignoring {@link IOException}
    *
@@ -401,6 +414,13 @@ public class IOUtils {
           "File/Directory " + fileToSync.getAbsolutePath() + " does not exist");
     }
     boolean isDir = fileToSync.isDirectory();
+
+    // HDFS-13586, FileChannel.open fails with AccessDeniedException
+    // for any directory, ignore.
+    if (isDir && Shell.WINDOWS) {
+      return;
+    }
+
     // If the file is a directory we have to open read-only, for regular files
     // we must open r/w for the fsync to have an effect. See
     // http://blog.httrack.com/blog/2013/11/15/
@@ -438,5 +458,79 @@ public class IOUtils {
       // Throw original exception
       throw ioe;
     }
+  }
+
+  /**
+   * Takes an IOException, file/directory path, and method name and returns an
+   * IOException with the input exception as the cause and also include the
+   * file,method details. The new exception provides the stack trace of the
+   * place where the exception is thrown and some extra diagnostics
+   * information.
+   *
+   * Return instance of same exception if exception class has a public string
+   * constructor; Otherwise return an PathIOException.
+   * InterruptedIOException and PathIOException are returned unwrapped.
+   *
+   * @param path file/directory path
+   * @param methodName method name
+   * @param exception the caught exception.
+   * @return an exception to throw
+   */
+  public static IOException wrapException(final String path,
+      final String methodName, final IOException exception) {
+
+    if (exception instanceof InterruptedIOException
+        || exception instanceof PathIOException) {
+      return exception;
+    } else {
+      String msg = String
+          .format("Failed with %s while processing file/directory :[%s] in "
+                  + "method:[%s]",
+              exception.getClass().getName(), path, methodName);
+      try {
+        return wrapWithMessage(exception, msg);
+      } catch (Exception ex) {
+        // For subclasses which have no (String) constructor throw IOException
+        // with wrapped message
+
+        return new PathIOException(path, exception);
+      }
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private static <T extends IOException> T wrapWithMessage(
+      final T exception, final String msg) throws T {
+    Class<? extends Throwable> clazz = exception.getClass();
+    try {
+      Constructor<? extends Throwable> ctor = clazz
+          .getConstructor(String.class);
+      Throwable t = ctor.newInstance(msg);
+      return (T) (t.initCause(exception));
+    } catch (Throwable e) {
+      LOG.warn("Unable to wrap exception of type " +
+          clazz + ": it has no (String) constructor", e);
+      throw exception;
+    }
+  }
+
+  /**
+   * Reads a DataInput until EOF and returns a byte array.  Make sure not to
+   * pass in an infinite DataInput or this will never return.
+   *
+   * @param in A DataInput
+   * @return a byte array containing the data from the DataInput
+   * @throws IOException on I/O error, other than EOF
+   */
+  public static byte[] readFullyToByteArray(DataInput in) throws IOException {
+    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+    try {
+      while (true) {
+        baos.write(in.readByte());
+      }
+    } catch (EOFException eof) {
+      // finished reading, do nothing
+    }
+    return baos.toByteArray();
   }
 }

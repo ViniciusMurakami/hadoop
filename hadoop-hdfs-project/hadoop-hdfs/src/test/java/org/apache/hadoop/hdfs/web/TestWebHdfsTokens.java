@@ -56,11 +56,11 @@ import org.apache.hadoop.security.authentication.client.ConnectionConfigurator;
 import org.apache.hadoop.security.ssl.KeyStoreTestUtil;
 import org.apache.hadoop.security.token.SecretManager.InvalidToken;
 import org.apache.hadoop.test.GenericTestUtils;
+import org.apache.hadoop.test.Whitebox;
 import org.apache.hadoop.security.token.Token;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.mockito.internal.util.reflection.Whitebox;
 
 public class TestWebHdfsTokens {
   private static Configuration conf;
@@ -385,7 +385,7 @@ public class TestWebHdfsTokens {
     InputStream is = fs.open(p);
     is.read();
     is.close();
-    verify(fs, times(2)).getDelegationToken(); // first bad, then good
+    verify(fs, times(3)).getDelegationToken(); // first bad, then good
     verify(fs, times(1)).replaceExpiredDelegationToken();
     verify(fs, times(1)).getDelegationToken(null);
     verify(fs, times(1)).setDelegationToken(any());
@@ -402,7 +402,7 @@ public class TestWebHdfsTokens {
     is = fs.open(p);
     is.read();
     is.close();
-    verify(fs, times(2)).getDelegationToken(); // first bad, then good
+    verify(fs, times(3)).getDelegationToken(); // first bad, then good
     verify(fs, times(1)).replaceExpiredDelegationToken();
     verify(fs, times(1)).getDelegationToken(null);
     verify(fs, times(1)).setDelegationToken(any());

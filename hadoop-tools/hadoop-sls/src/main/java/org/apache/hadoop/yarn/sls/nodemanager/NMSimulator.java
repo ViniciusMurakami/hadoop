@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.DelayQueue;
 
@@ -35,24 +36,25 @@ import org.apache.hadoop.yarn.api.records.ContainerExitStatus;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerState;
 import org.apache.hadoop.yarn.api.records.ContainerStatus;
+import org.apache.hadoop.yarn.api.records.NodeLabel;
+import org.apache.hadoop.yarn.api.records.Resource;
+import org.apache.hadoop.yarn.api.records.ResourceUtilization;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.server.api.protocolrecords.NodeHeartbeatRequest;
 import org.apache.hadoop.yarn.server.api.protocolrecords.NodeHeartbeatResponse;
-import org.apache.hadoop.yarn.server.api.protocolrecords
-        .RegisterNodeManagerRequest;
-import org.apache.hadoop.yarn.server.api.protocolrecords
-        .RegisterNodeManagerResponse;
+import org.apache.hadoop.yarn.server.api.protocolrecords.RegisterNodeManagerRequest;
+import org.apache.hadoop.yarn.server.api.protocolrecords.RegisterNodeManagerResponse;
 import org.apache.hadoop.yarn.server.api.records.MasterKey;
 import org.apache.hadoop.yarn.server.api.records.NodeAction;
 import org.apache.hadoop.yarn.server.api.records.NodeHealthStatus;
 import org.apache.hadoop.yarn.server.api.records.NodeStatus;
 import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
-import org.apache.hadoop.yarn.server.utils.BuilderUtils;
 import org.apache.hadoop.yarn.util.Records;
 import org.apache.hadoop.yarn.sls.scheduler.ContainerSimulator;
 import org.apache.hadoop.yarn.sls.scheduler.TaskRunner;
 import org.apache.hadoop.yarn.sls.utils.SLSUtils;
+import org.apache.hadoop.yarn.util.resource.Resources;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -72,19 +74,21 @@ public class NMSimulator extends TaskRunner.Task {
   // resource manager
   private ResourceManager rm;
   // heart beat response id
-  private int RESPONSE_ID = 1;
+  private int responseId = 0;
+  private float resourceUtilizationRatio;
   private final static Logger LOG = LoggerFactory.getLogger(NMSimulator.class);
   
-  public void init(String nodeIdStr, int memory, int cores,
-          int dispatchTime, int heartBeatInterval, ResourceManager rm)
-          throws IOException, YarnException {
+  public void init(String nodeIdStr, Resource nodeResource, int dispatchTime,
+      int heartBeatInterval, ResourceManager pRm,
+      float pResourceUtilizationRatio, Set<NodeLabel> labels)
+      throws IOException, YarnException {
     super.init(dispatchTime, dispatchTime + 1000000L * heartBeatInterval,
-            heartBeatInterval);
+        heartBeatInterval);
     // create resource
     String rackHostName[] = SLSUtils.getRackHostName(nodeIdStr);
-    this.node = NodeInfo.newNodeInfo(rackHostName[0], rackHostName[1], 
-                  BuilderUtils.newResource(memory, cores));
-    this.rm = rm;
+    this.node = NodeInfo.newNodeInfo(rackHostName[0], rackHostName[1],
+        Resources.clone(nodeResource));
+    this.rm = pRm;
     // init data structures
     completedContainerList =
             Collections.synchronizedList(new ArrayList<ContainerId>());
@@ -100,10 +104,20 @@ public class NMSimulator extends TaskRunner.Task {
             Records.newRecord(RegisterNodeManagerRequest.class);
     req.setNodeId(node.getNodeID());
     req.setResource(node.getTotalCapability());
+    req.setNodeLabels(labels);
     req.setHttpPort(80);
-    RegisterNodeManagerResponse response = rm.getResourceTrackerService()
+    RegisterNodeManagerResponse response = this.rm.getResourceTrackerService()
             .registerNodeManager(req);
     masterKey = response.getNMTokenMasterKey();
+    this.resourceUtilizationRatio = pResourceUtilizationRatio;
+  }
+
+  public void init(String nodeIdStr, Resource nodeResource, int dispatchTime,
+      int heartBeatInterval, ResourceManager pRm,
+      float pResourceUtilizationRatio)
+      throws IOException, YarnException {
+    init(nodeIdStr, nodeResource, dispatchTime, heartBeatInterval, pRm,
+        pResourceUtilizationRatio, null);
   }
 
   @Override
@@ -132,8 +146,20 @@ public class NMSimulator extends TaskRunner.Task {
     ns.setContainersStatuses(generateContainerStatusList());
     ns.setNodeId(node.getNodeID());
     ns.setKeepAliveApplications(new ArrayList<ApplicationId>());
-    ns.setResponseId(RESPONSE_ID ++);
+    ns.setResponseId(responseId++);
     ns.setNodeHealthStatus(NodeHealthStatus.newInstance(true, "", 0));
+
+    //set node & containers utilization
+    if (resourceUtilizationRatio > 0 && resourceUtilizationRatio <=1) {
+      int pMemUsed = Math.round(node.getTotalCapability().getMemorySize()
+          * resourceUtilizationRatio);
+      float cpuUsed = node.getTotalCapability().getVirtualCores()
+          * resourceUtilizationRatio;
+      ResourceUtilization resourceUtilization = ResourceUtilization.newInstance(
+          pMemUsed, pMemUsed, cpuUsed);
+      ns.setContainersUtilization(resourceUtilization);
+      ns.setNodeUtilization(resourceUtilization);
+    }
     beatRequest.setNodeStatus(ns);
     NodeHeartbeatResponse beatResponse =
         rm.getResourceTrackerService().nodeHeartbeat(beatRequest);

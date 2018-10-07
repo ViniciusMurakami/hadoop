@@ -20,6 +20,10 @@ package org.apache.hadoop.yarn.server.nodemanager.containermanager.localizer;
 import static org.apache.hadoop.fs.CreateFlag.CREATE;
 import static org.apache.hadoop.fs.CreateFlag.OVERWRITE;
 
+import org.apache.hadoop.yarn.server.nodemanager.recovery.RecoveryIterator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -50,8 +54,6 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.codec.digest.DigestUtils;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
@@ -148,9 +150,12 @@ import com.google.common.util.concurrent.ThreadFactoryBuilder;
 public class ResourceLocalizationService extends CompositeService
     implements EventHandler<LocalizationEvent>, LocalizationProtocol {
 
-  private static final Log LOG = LogFactory.getLog(ResourceLocalizationService.class);
+  private static final Logger LOG =
+       LoggerFactory.getLogger(ResourceLocalizationService.class);
   public static final String NM_PRIVATE_DIR = "nmPrivate";
   public static final FsPermission NM_PRIVATE_PERM = new FsPermission((short) 0700);
+  private static final FsPermission PUBLIC_FILECACHE_FOLDER_PERMS =
+      new FsPermission((short) 0755);
 
   private Server server;
   private InetSocketAddress localizationServerAddress;
@@ -261,10 +266,7 @@ public class ResourceLocalizationService extends CompositeService
     }
 
     diskValidator = DiskValidatorFactory.getInstance(
-        conf.get(YarnConfiguration.DISK_VALIDATOR,
-            YarnConfiguration.DEFAULT_DISK_VALIDATOR));
-    LOG.info("Disk Validator: " + YarnConfiguration.DISK_VALIDATOR +
-        " is loaded.");
+        YarnConfiguration.DEFAULT_DISK_VALIDATOR);
     cacheTargetSize =
       conf.getLong(YarnConfiguration.NM_LOCALIZER_CACHE_TARGET_SIZE_MB, YarnConfiguration.DEFAULT_NM_LOCALIZER_CACHE_TARGET_SIZE_MB) << 20;
     cacheCleanupPeriod =
@@ -295,70 +297,77 @@ public class ResourceLocalizationService extends CompositeService
 
   //Recover localized resources after an NM restart
   public void recoverLocalizedResources(RecoveredLocalizationState state)
-      throws URISyntaxException {
+      throws URISyntaxException, IOException {
     LocalResourceTrackerState trackerState = state.getPublicTrackerState();
     recoverTrackerResources(publicRsrc, trackerState);
 
-    for (Map.Entry<String, RecoveredUserResources> userEntry :
-         state.getUserResources().entrySet()) {
-      String user = userEntry.getKey();
-      RecoveredUserResources userResources = userEntry.getValue();
-      trackerState = userResources.getPrivateTrackerState();
-      if (!trackerState.isEmpty()) {
+    try (RecoveryIterator<Map.Entry<String, RecoveredUserResources>> it
+             = state.getIterator()) {
+      while (it.hasNext()) {
+        Map.Entry<String, RecoveredUserResources> userEntry = it.next();
+        String user = userEntry.getKey();
+        RecoveredUserResources userResources = userEntry.getValue();
+        trackerState = userResources.getPrivateTrackerState();
         LocalResourcesTracker tracker = new LocalResourcesTrackerImpl(user,
-            null, dispatcher, true, super.getConfig(), stateStore, dirsHandler);
+            null, dispatcher, true, super.getConfig(), stateStore,
+            dirsHandler);
         LocalResourcesTracker oldTracker = privateRsrc.putIfAbsent(user,
             tracker);
         if (oldTracker != null) {
           tracker = oldTracker;
         }
         recoverTrackerResources(tracker, trackerState);
-      }
 
-      for (Map.Entry<ApplicationId, LocalResourceTrackerState> appEntry :
-           userResources.getAppTrackerStates().entrySet()) {
-        trackerState = appEntry.getValue();
-        if (!trackerState.isEmpty()) {
+        for (Map.Entry<ApplicationId, LocalResourceTrackerState> appEntry :
+            userResources.getAppTrackerStates().entrySet()) {
+          trackerState = appEntry.getValue();
           ApplicationId appId = appEntry.getKey();
           String appIdStr = appId.toString();
-          LocalResourcesTracker tracker = new LocalResourcesTrackerImpl(user,
+          LocalResourcesTracker tracker1 = new LocalResourcesTrackerImpl(user,
               appId, dispatcher, false, super.getConfig(), stateStore,
               dirsHandler);
-          LocalResourcesTracker oldTracker = appRsrc.putIfAbsent(appIdStr,
-              tracker);
-          if (oldTracker != null) {
-            tracker = oldTracker;
+          LocalResourcesTracker oldTracker1 = appRsrc.putIfAbsent(appIdStr,
+              tracker1);
+          if (oldTracker1 != null) {
+            tracker1 = oldTracker1;
           }
-          recoverTrackerResources(tracker, trackerState);
+          recoverTrackerResources(tracker1, trackerState);
         }
       }
     }
   }
 
   private void recoverTrackerResources(LocalResourcesTracker tracker,
-      LocalResourceTrackerState state) throws URISyntaxException {
-    for (LocalizedResourceProto proto : state.getLocalizedResources()) {
-      LocalResource rsrc = new LocalResourcePBImpl(proto.getResource());
-      LocalResourceRequest req = new LocalResourceRequest(rsrc);
-      if (LOG.isDebugEnabled()) {
-        LOG.debug("Recovering localized resource " + req + " at "
-            + proto.getLocalPath());
+      LocalResourceTrackerState state) throws URISyntaxException, IOException {
+    try (RecoveryIterator<LocalizedResourceProto> it =
+             state.getCompletedResourcesIterator()) {
+      while (it != null && it.hasNext()) {
+        LocalizedResourceProto proto = it.next();
+        LocalResource rsrc = new LocalResourcePBImpl(proto.getResource());
+        LocalResourceRequest req = new LocalResourceRequest(rsrc);
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Recovering localized resource " + req + " at "
+              + proto.getLocalPath());
+        }
+        tracker.handle(new ResourceRecoveredEvent(req,
+            new Path(proto.getLocalPath()), proto.getSize()));
       }
-      tracker.handle(new ResourceRecoveredEvent(req,
-          new Path(proto.getLocalPath()), proto.getSize()));
     }
 
-    for (Map.Entry<LocalResourceProto, Path> entry :
-         state.getInProgressResources().entrySet()) {
-      LocalResource rsrc = new LocalResourcePBImpl(entry.getKey());
-      LocalResourceRequest req = new LocalResourceRequest(rsrc);
-      Path localPath = entry.getValue();
-      tracker.handle(new ResourceRecoveredEvent(req, localPath, 0));
+    try (RecoveryIterator<Map.Entry<LocalResourceProto, Path>> it =
+             state.getStartedResourcesIterator()) {
+      while (it != null && it.hasNext()) {
+        Map.Entry<LocalResourceProto, Path> entry = it.next();
+        LocalResource rsrc = new LocalResourcePBImpl(entry.getKey());
+        LocalResourceRequest req = new LocalResourceRequest(rsrc);
+        Path localPath = entry.getValue();
+        tracker.handle(new ResourceRecoveredEvent(req, localPath, 0));
 
-      // delete any in-progress localizations, containers will request again
-      LOG.info("Deleting in-progress localization for " + req + " at "
-          + localPath);
-      tracker.remove(tracker.getLocalizedResource(req), delService);
+        // delete any in-progress localizations, containers will request again
+        LOG.info("Deleting in-progress localization for " + req + " at "
+            + localPath);
+        tracker.remove(tracker.getLocalizedResource(req), delService);
+      }
     }
 
     // TODO: remove untracked directories in local filesystem
@@ -406,7 +415,7 @@ public class ResourceLocalizationService extends CompositeService
     if (conf.getBoolean(
         CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHORIZATION, 
         false)) {
-      server.refreshServiceAcl(conf, new NMPolicyProvider());
+      server.refreshServiceAcl(conf, NMPolicyProvider.getInstance());
     }
     
     return server;
@@ -556,7 +565,7 @@ public class ResourceLocalizationService extends CompositeService
       rsrcCleanup.getResources();
     for (Map.Entry<LocalResourceVisibility, Collection<LocalResourceRequest>> e :
          rsrcs.entrySet()) {
-      LocalResourcesTracker tracker = getLocalResourcesTracker(e.getKey(), c.getUser(), 
+      LocalResourcesTracker tracker = getLocalResourcesTracker(e.getKey(), c.getUser(),
           c.getContainerId().getApplicationAttemptId()
           .getApplicationId());
       for (LocalResourceRequest req : e.getValue()) {
@@ -858,7 +867,7 @@ public class ResourceLocalizationService extends CompositeService
       // TODO handle failures, cancellation, requests by other containers
       LocalizedResource rsrc = request.getResource();
       LocalResourceRequest key = rsrc.getRequest();
-      LOG.info("Downloading public rsrc:" + key);
+      LOG.info("Downloading public resource: " + key);
       /*
        * Here multiple containers may request the same resource. So we need
        * to start downloading only when
@@ -879,7 +888,11 @@ public class ResourceLocalizationService extends CompositeService
             Path publicDirDestPath =
                 publicRsrc.getPathForLocalization(key, publicRootPath,
                     delService);
+            if (publicDirDestPath == null) {
+              return;
+            }
             if (!publicDirDestPath.getParent().equals(publicRootPath)) {
+              createParentDirs(publicDirDestPath, publicRootPath);
               if (diskValidator != null) {
                 diskValidator.checkStatus(
                     new File(publicDirDestPath.toUri().getPath()));
@@ -917,8 +930,34 @@ public class ResourceLocalizationService extends CompositeService
                 + " Either queue is full or threadpool is shutdown.", re);
           }
         } else {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("Skip downloading resource: " + key + " since it's in"
+                + " state: " + rsrc.getState());
+          }
           rsrc.unlock();
         }
+      } else {
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Skip downloading resource: " + key + " since it is locked"
+              + " by other threads");
+        }
+      }
+    }
+
+    private void createParentDirs(Path destDirPath, Path destDirRoot)
+        throws IOException {
+      if (destDirPath == null || destDirPath.equals(destDirRoot)) {
+        return;
+      }
+      createParentDirs(destDirPath.getParent(), destDirRoot);
+      createDir(destDirPath, PUBLIC_FILECACHE_FOLDER_PERMS);
+    }
+
+    private void createDir(Path dirPath, FsPermission perms)
+        throws IOException {
+      lfs.mkdir(dirPath, perms, false);
+      if (!perms.equals(perms.applyUMask(lfs.getUMask()))) {
+        lfs.setPermission(dirPath, perms);
       }
     }
 
@@ -942,11 +981,17 @@ public class ResourceLocalizationService extends CompositeService
                 .getDU(new File(local.toUri()))));
               assoc.getResource().unlock();
             } catch (ExecutionException e) {
-              LOG.info("Failed to download resource " + assoc.getResource(),
-                  e.getCause());
-              LocalResourceRequest req = assoc.getResource().getRequest();
-              publicRsrc.handle(new ResourceFailedLocalizationEvent(req,
-                  e.getMessage()));
+              String user = assoc.getContext().getUser();
+              ApplicationId applicationId = assoc.getContext().getContainerId().getApplicationAttemptId().getApplicationId();
+              LocalResourcesTracker tracker =
+                getLocalResourcesTracker(LocalResourceVisibility.APPLICATION, user, applicationId);
+              final String diagnostics = "Failed to download resource " +
+                  assoc.getResource() + " " + e.getCause();
+              tracker.handle(new ResourceFailedLocalizationEvent(
+                  assoc.getResource().getRequest(), diagnostics));
+              publicRsrc.handle(new ResourceFailedLocalizationEvent(
+                  assoc.getResource().getRequest(), diagnostics));
+              LOG.error(diagnostics);
               assoc.getResource().unlock();
             } catch (CancellationException e) {
               // ignore; shutting down
@@ -956,7 +1001,7 @@ public class ResourceLocalizationService extends CompositeService
           }
         }
       } catch(Throwable t) {
-        LOG.fatal("Error: Shutting down", t);
+        LOG.error("Error: Shutting down", t);
       } finally {
         LOG.info("Public cache exiting");
         threadPool.shutdownNow();
@@ -1136,10 +1181,11 @@ public class ResourceLocalizationService extends CompositeService
           LocalResourcesTracker tracker = getLocalResourcesTracker(
               next.getVisibility(), user, applicationId);
           if (tracker != null) {
-            ResourceLocalizationSpec resource =
-                NodeManagerBuilderUtils.newResourceLocalizationSpec(next,
-                getPathForLocalization(next, tracker));
-            rsrcs.add(resource);
+            Path localPath = getPathForLocalization(next, tracker);
+            if (localPath != null) {
+              rsrcs.add(NodeManagerBuilderUtils.newResourceLocalizationSpec(
+                  next, localPath));
+            }
           }
         } catch (IOException e) {
           LOG.error("local path for PRIVATE localization could not be " +
@@ -1216,7 +1262,7 @@ public class ResourceLocalizationService extends CompositeService
         exception = e;
       } finally {
         if (exception != null) {
-          LOG.info("Localizer failed", exception);
+          LOG.info("Localizer failed for "+localizerId, exception);
           // On error, report failure to Container and signal ABORT
           // Notify resource of failed localization
           ContainerId cId = context.getContainerId();

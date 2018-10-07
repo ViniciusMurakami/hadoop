@@ -38,34 +38,46 @@ import java.io.IOException;
 public interface ApplicationMasterServiceProcessor {
 
   /**
+   * Initialize with and ApplicationMasterService Context as well as the
+   * next processor in the chain.
+   * @param amsContext AMSContext.
+   * @param nextProcessor next ApplicationMasterServiceProcessor
+   */
+  void init(ApplicationMasterServiceContext amsContext,
+      ApplicationMasterServiceProcessor nextProcessor);
+
+  /**
    * Register AM attempt.
    * @param applicationAttemptId applicationAttemptId.
    * @param request Register Request.
-   * @return Register Response.
+   * @param response Register Response.
    * @throws IOException IOException.
+   * @throws YarnException in critical situation where invalid
+   *         profiles/resources are added.
    */
-  RegisterApplicationMasterResponse registerApplicationMaster(
-      ApplicationAttemptId applicationAttemptId,
-      RegisterApplicationMasterRequest request) throws IOException;
+  void registerApplicationMaster(ApplicationAttemptId applicationAttemptId,
+      RegisterApplicationMasterRequest request,
+      RegisterApplicationMasterResponse response)
+      throws IOException, YarnException;
 
   /**
    * Allocate call.
    * @param appAttemptId appAttemptId.
    * @param request Allocate Request.
-   * @return Allocate Response.
+   * @param response Allocate Response.
    * @throws YarnException YarnException.
    */
-  AllocateResponse allocate(ApplicationAttemptId appAttemptId,
-      AllocateRequest request) throws YarnException;
+  void allocate(ApplicationAttemptId appAttemptId,
+      AllocateRequest request, AllocateResponse response) throws YarnException;
 
   /**
    * Finish AM.
    * @param applicationAttemptId applicationAttemptId.
    * @param request Finish AM Request.
-   * @return Finish AM response.
+   * @param response Finish AM Response.
    */
-  FinishApplicationMasterResponse finishApplicationMaster(
+  void finishApplicationMaster(
       ApplicationAttemptId applicationAttemptId,
-      FinishApplicationMasterRequest request);
-
+      FinishApplicationMasterRequest request,
+      FinishApplicationMasterResponse response);
 }

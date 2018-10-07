@@ -21,7 +21,9 @@ package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -34,10 +36,10 @@ import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.classification.InterfaceStability.Unstable;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
+import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.QueueACL;
 import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
 import org.apache.hadoop.yarn.api.records.Resource;
-import org.apache.hadoop.yarn.server.resourcemanager.resource.ResourceWeights;
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ActiveUsersManager;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerAppUtils;
@@ -52,12 +54,13 @@ public class FSLeafQueue extends FSQueue {
   private static final Log LOG = LogFactory.getLog(FSLeafQueue.class.getName());
   private static final List<FSQueue> EMPTY_LIST = Collections.emptyList();
 
-  private FairScheduler scheduler;
   private FSContext context;
 
   // apps that are runnable
   private final List<FSAppAttempt> runnableApps = new ArrayList<>();
   private final List<FSAppAttempt> nonRunnableApps = new ArrayList<>();
+  // assignedApps keeps track of applications that have no appAttempts
+  private final Set<ApplicationId> assignedApps = new HashSet<>();
   // get a lock with fair distribution for app list updates
   private final ReadWriteLock rwl = new ReentrantReadWriteLock(true);
   private final Lock readLock = rwl.readLock();
@@ -76,7 +79,6 @@ public class FSLeafQueue extends FSQueue {
   public FSLeafQueue(String name, FairScheduler scheduler,
       FSParentQueue parent) {
     super(name, scheduler, parent);
-    this.scheduler = scheduler;
     this.context = scheduler.getContext();
     this.lastTimeAtMinShare = scheduler.getClock().getTime();
     activeUsersManager = new ActiveUsersManager(getMetrics());
@@ -92,16 +94,10 @@ public class FSLeafQueue extends FSQueue {
       } else {
         nonRunnableApps.add(app);
       }
-    } finally {
-      writeLock.unlock();
-    }
-  }
-  
-  // for testing
-  void addAppSchedulable(FSAppAttempt appSched) {
-    writeLock.lock();
-    try {
-      runnableApps.add(appSched);
+      // when an appAttempt is created for an application, we'd like to move
+      // it over from assignedApps to either runnableApps or nonRunnableApps
+      assignedApps.remove(app.getApplicationId());
+      incUsedResource(app.getResourceUsage());
     } finally {
       writeLock.unlock();
     }
@@ -136,6 +132,7 @@ public class FSLeafQueue extends FSQueue {
       getMetrics().setAMResourceUsage(amResourceUsage);
     }
 
+    decUsedResource(app.getResourceUsage());
     return runnable;
   }
 
@@ -305,23 +302,6 @@ public class FSLeafQueue extends FSQueue {
     return demand;
   }
 
-  @Override
-  public Resource getResourceUsage() {
-    Resource usage = Resources.createResource(0);
-    readLock.lock();
-    try {
-      for (FSAppAttempt app : runnableApps) {
-        Resources.addTo(usage, app.getResourceUsage());
-      }
-      for (FSAppAttempt app : nonRunnableApps) {
-        Resources.addTo(usage, app.getResourceUsage());
-      }
-    } finally {
-      readLock.unlock();
-    }
-    return usage;
-  }
-
   Resource getAmResourceUsage() {
     return amResourceUsage;
   }
@@ -345,10 +325,10 @@ public class FSLeafQueue extends FSQueue {
       readLock.unlock();
     }
     // Cap demand to maxShare to limit allocation to maxShare
-    demand = Resources.componentwiseMin(tmpDemand, maxShare);
+    demand = Resources.componentwiseMin(tmpDemand, getMaxShare());
     if (LOG.isDebugEnabled()) {
       LOG.debug("The updated demand for " + getName() + " is " + demand
-          + "; the max is " + maxShare);
+          + "; the max is " + getMaxShare());
       LOG.debug("The updated fairshare for " + getName() + " is "
           + getFairShare());
     }
@@ -468,6 +448,15 @@ public class FSLeafQueue extends FSQueue {
     return numPendingApps;
   }
 
+  public int getNumAssignedApps() {
+    readLock.lock();
+    try {
+      return assignedApps.size();
+    } finally {
+      readLock.unlock();
+    }
+  }
+
   /**
    * TODO: Based on how frequently this is called, we might want to club
    * counting pending and active apps in the same method.
@@ -555,7 +544,17 @@ public class FSLeafQueue extends FSQueue {
    * @param weight queue weight
    */
   public void setWeights(float weight) {
-    this.weights = new ResourceWeights(weight);
+    this.weights = weight;
+  }
+
+  @Override
+  public Resource getMaximumContainerAllocation() {
+    if (maxContainerAllocation.equals(Resources.unbounded())
+        && getParent() != null) {
+      return getParent().getMaximumContainerAllocation();
+    } else {
+      return maxContainerAllocation;
+    }
   }
 
   /**
@@ -565,13 +564,14 @@ public class FSLeafQueue extends FSQueue {
    */
   private Resource minShareStarvation() {
     // If demand < minshare, we should use demand to determine starvation
-    Resource desiredShare = Resources.min(policy.getResourceCalculator(),
-        scheduler.getClusterResource(), getMinShare(), getDemand());
+    Resource starvation =
+        Resources.componentwiseMin(getMinShare(), getDemand());
 
-    Resource starvation = Resources.subtract(desiredShare, getResourceUsage());
+    Resources.subtractFromNonNegative(starvation, getResourceUsage());
+
     boolean starved = !Resources.isNone(starvation);
-
     long now = scheduler.getClock().getTime();
+
     if (!starved) {
       // Record that the queue is not starved
       setLastTimeAtMinShare(now);
@@ -624,7 +624,7 @@ public class FSLeafQueue extends FSQueue {
         ", Policy: " + policy.getName() +
         ", FairShare: " + getFairShare() +
         ", SteadyFairShare: " + getSteadyFairShare() +
-        ", MaxShare: " + maxShare +
+        ", MaxShare: " + getMaxShare() +
         ", MinShare: " + minShare +
         ", ResourceUsage: " + getResourceUsage() +
         ", Demand: " + getDemand() +
@@ -636,5 +636,19 @@ public class FSLeafQueue extends FSQueue {
         ", AMResourceUsage: " + getAmResourceUsage() +
         ", LastTimeAtMinShare: " + lastTimeAtMinShare +
         "}");
+  }
+
+  /**
+   * This method is called when an application is assigned to this queue
+   * for book-keeping purposes (to be able to determine if the queue is empty).
+   * @param applicationId the application's id
+   */
+  public void addAssignedApp(ApplicationId applicationId) {
+    writeLock.lock();
+    try {
+      assignedApps.add(applicationId);
+    } finally {
+      writeLock.unlock();
+    }
   }
 }

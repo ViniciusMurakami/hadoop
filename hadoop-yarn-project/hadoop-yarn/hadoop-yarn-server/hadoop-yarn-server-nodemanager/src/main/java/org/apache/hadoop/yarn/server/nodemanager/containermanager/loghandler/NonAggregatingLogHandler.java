@@ -19,16 +19,20 @@ package org.apache.hadoop.yarn.server.nodemanager.containermanager.loghandler;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.RejectedExecutionException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileContext;
 import org.apache.hadoop.fs.Path;
@@ -60,8 +64,8 @@ import com.google.common.util.concurrent.ThreadFactoryBuilder;
 public class NonAggregatingLogHandler extends AbstractService implements
     LogHandler {
 
-  private static final Log LOG = LogFactory
-      .getLog(NonAggregatingLogHandler.class);
+  private static final Logger LOG =
+       LoggerFactory.getLogger(NonAggregatingLogHandler.class);
   private final Dispatcher dispatcher;
   private final DeletionService delService;
   private final Map<ApplicationId, String> appOwners;
@@ -202,6 +206,11 @@ public class NonAggregatingLogHandler extends AbstractService implements
       default:
         ; // Ignore
     }
+  }
+
+  @Override
+  public Set<ApplicationId> getInvalidTokenApps() {
+    return Collections.emptySet();
   }
 
   ScheduledThreadPoolExecutor createScheduledThreadPoolExecutor(

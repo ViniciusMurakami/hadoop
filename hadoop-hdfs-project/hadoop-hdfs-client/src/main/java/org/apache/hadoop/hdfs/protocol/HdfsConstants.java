@@ -47,9 +47,12 @@ public final class HdfsConstants {
   public static final String WARM_STORAGE_POLICY_NAME = "WARM";
   public static final byte COLD_STORAGE_POLICY_ID = 2;
   public static final String COLD_STORAGE_POLICY_NAME = "COLD";
+  public static final byte PROVIDED_STORAGE_POLICY_ID = 1;
+  public static final String PROVIDED_STORAGE_POLICY_NAME = "PROVIDED";
 
-  // TODO should be conf injected?
-  public static final int DEFAULT_DATA_SOCKET_SIZE = 128 * 1024;
+
+  public static final int DEFAULT_DATA_SOCKET_SIZE = 0;
+
   /**
    * A special path component contained in the path for a snapshot file/dir
    */
@@ -58,6 +61,10 @@ public final class HdfsConstants {
           = Path.SEPARATOR + DOT_SNAPSHOT_DIR;
   public static final String SEPARATOR_DOT_SNAPSHOT_DIR_SEPARATOR
       = Path.SEPARATOR + DOT_SNAPSHOT_DIR + Path.SEPARATOR;
+  public final static String DOT_RESERVED_STRING = ".reserved";
+  public final static String DOT_RESERVED_PATH_PREFIX = Path.SEPARATOR
+      + DOT_RESERVED_STRING;
+  public final static String DOT_INODES_STRING = ".inodes";
 
   /**
    * Generation stamp of blocks that pre-date the introduction
@@ -121,6 +128,38 @@ public final class HdfsConstants {
     SAFEMODE_LEAVE, SAFEMODE_ENTER, SAFEMODE_GET, SAFEMODE_FORCE_EXIT
   }
 
+  /**
+   * Storage policy satisfier service modes.
+   */
+  public enum StoragePolicySatisfierMode {
+
+    /**
+     * This mode represents that SPS service is running outside Namenode as an
+     * external service and can accept any SPS call request.
+     */
+    EXTERNAL,
+
+    /**
+     * This mode represents that SPS service is disabled and cannot accept any
+     * SPS call request.
+     */
+    NONE;
+
+    private static final Map<String, StoragePolicySatisfierMode> MAP =
+        new HashMap<>();
+
+    static {
+      for (StoragePolicySatisfierMode a : values()) {
+        MAP.put(a.name(), a);
+      }
+    }
+
+    /** Convert the given String to a StoragePolicySatisfierMode. */
+    public static StoragePolicySatisfierMode fromString(String s) {
+      return MAP.get(StringUtils.toUpperCase(s));
+    }
+  }
+
   public enum RollingUpgradeAction {
     QUERY, PREPARE, FINALIZE;
 
@@ -139,9 +178,23 @@ public final class HdfsConstants {
     }
   }
 
+  /**
+   * Upgrade actions.
+   */
+  public enum UpgradeAction {
+    QUERY, FINALIZE;
+  }
+
   // type of the datanode report
   public enum DatanodeReportType {
     ALL, LIVE, DEAD, DECOMMISSIONING, ENTERING_MAINTENANCE, IN_MAINTENANCE
+  }
+
+  /**
+   * Re-encrypt encryption zone actions.
+   */
+  public enum ReencryptAction {
+    CANCEL, START
   }
 
   /* Hidden constructor */

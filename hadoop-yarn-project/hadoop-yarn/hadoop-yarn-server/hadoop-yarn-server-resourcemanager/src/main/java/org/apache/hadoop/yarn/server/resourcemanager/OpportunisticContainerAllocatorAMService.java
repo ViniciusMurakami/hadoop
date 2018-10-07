@@ -18,17 +18,23 @@
 
 package org.apache.hadoop.yarn.server.resourcemanager;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.ipc.RPC;
 import org.apache.hadoop.ipc.Server;
+import org.apache.hadoop.yarn.ams.ApplicationMasterServiceContext;
 import org.apache.hadoop.yarn.ams.ApplicationMasterServiceProcessor;
 import org.apache.hadoop.yarn.ams.ApplicationMasterServiceUtils;
 import org.apache.hadoop.yarn.api.ApplicationMasterProtocolPB;
+import org.apache.hadoop.yarn.api.protocolrecords
+    .FinishApplicationMasterRequest;
+import org.apache.hadoop.yarn.api.protocolrecords.FinishApplicationMasterResponse;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.Container;
 import org.apache.hadoop.yarn.api.records.NodeId;
+import org.apache.hadoop.yarn.api.records.ResourceRequest;
 import org.apache.hadoop.yarn.event.EventHandler;
 import org.apache.hadoop.yarn.security.AMRMTokenIdentifier;
 import org.apache.hadoop.yarn.server.api.DistributedSchedulingAMProtocol;
@@ -101,17 +107,30 @@ public class OpportunisticContainerAllocatorAMService
   private volatile List<RemoteNode> cachedNodes;
   private volatile long lastCacheUpdateTime;
 
-  class OpportunisticAMSProcessor extends DefaultAMSProcessor {
+  class OpportunisticAMSProcessor implements
+      ApplicationMasterServiceProcessor {
 
-    OpportunisticAMSProcessor(RMContext rmContext, YarnScheduler
-        scheduler) {
-      super(rmContext, scheduler);
+    private ApplicationMasterServiceContext context;
+    private ApplicationMasterServiceProcessor nextProcessor;
+
+    private YarnScheduler getScheduler() {
+      return ((RMContext)context).getScheduler();
     }
 
     @Override
-    public RegisterApplicationMasterResponse registerApplicationMaster(
+    public void init(ApplicationMasterServiceContext amsContext,
+        ApplicationMasterServiceProcessor next) {
+      this.context = amsContext;
+      // The AMSProcessingChain guarantees that 'next' is not null.
+      this.nextProcessor = next;
+    }
+
+    @Override
+    public void registerApplicationMaster(
         ApplicationAttemptId applicationAttemptId,
-        RegisterApplicationMasterRequest request) throws IOException {
+        RegisterApplicationMasterRequest request,
+        RegisterApplicationMasterResponse response)
+        throws IOException, YarnException {
       SchedulerApplicationAttempt appAttempt = ((AbstractYarnScheduler)
           getScheduler()).getApplicationAttempt(applicationAttemptId);
       if (appAttempt.getOpportunisticContainerContext() == null) {
@@ -135,12 +154,14 @@ public class OpportunisticContainerAllocatorAMService
             tokenExpiryInterval);
         appAttempt.setOpportunisticContainerContext(opCtx);
       }
-      return super.registerApplicationMaster(applicationAttemptId, request);
+      nextProcessor.registerApplicationMaster(
+          applicationAttemptId, request, response);
     }
 
     @Override
-    public AllocateResponse allocate(ApplicationAttemptId appAttemptId,
-        AllocateRequest request) throws YarnException {
+    public void allocate(ApplicationAttemptId appAttemptId,
+        AllocateRequest request, AllocateResponse response)
+        throws YarnException {
       // Partition requests to GUARANTEED and OPPORTUNISTIC.
       OpportunisticContainerAllocator.PartitionedResourceRequests
           partitionedAsks =
@@ -155,6 +176,16 @@ public class OpportunisticContainerAllocatorAMService
           appAttempt.getOpportunisticContainerContext();
       oppCtx.updateNodeList(getLeastLoadedNodes());
 
+      if (!partitionedAsks.getOpportunistic().isEmpty()) {
+        String appPartition = appAttempt.getAppAMNodePartitionName();
+
+        for (ResourceRequest req : partitionedAsks.getOpportunistic()) {
+          if (null == req.getNodeLabelExpression()) {
+            req.setNodeLabelExpression(appPartition);
+          }
+        }
+      }
+
       List<Container> oppContainers =
           oppContainerAllocator.allocateContainers(
               request.getResourceBlacklistRequest(),
@@ -165,17 +196,22 @@ public class OpportunisticContainerAllocatorAMService
       if (!oppContainers.isEmpty()) {
         handleNewContainers(oppContainers, false);
         appAttempt.updateNMTokens(oppContainers);
+        ApplicationMasterServiceUtils.addToAllocatedContainers(
+            response, oppContainers);
       }
 
       // Allocate GUARANTEED containers.
       request.setAskList(partitionedAsks.getGuaranteed());
+      nextProcessor.allocate(appAttemptId, request, response);
+    }
 
-      AllocateResponse response = super.allocate(appAttemptId, request);
-      if (!oppContainers.isEmpty()) {
-        ApplicationMasterServiceUtils.addToAllocatedContainers(
-            response, oppContainers);
-      }
-      return response;
+    @Override
+    public void finishApplicationMaster(
+        ApplicationAttemptId applicationAttemptId,
+        FinishApplicationMasterRequest request,
+        FinishApplicationMasterResponse response) {
+      nextProcessor.finishApplicationMaster(applicationAttemptId,
+          request, response);
     }
   }
 
@@ -237,11 +273,6 @@ public class OpportunisticContainerAllocatorAMService
   }
 
   @Override
-  protected ApplicationMasterServiceProcessor createProcessor() {
-    return new OpportunisticAMSProcessor(rmContext, rmContext.getScheduler());
-  }
-
-  @Override
   public Server getServer(YarnRPC rpc, Configuration serverConf,
       InetSocketAddress addr, AMRMTokenSecretManager secretManager) {
     if (YarnConfiguration.isDistSchedulingEnabled(serverConf)) {
@@ -259,6 +290,15 @@ public class OpportunisticContainerAllocatorAMService
       return server;
     }
     return super.getServer(rpc, serverConf, addr, secretManager);
+  }
+
+  @Override
+  protected List<ApplicationMasterServiceProcessor> getProcessorList(
+      Configuration conf) {
+    List<ApplicationMasterServiceProcessor> retVal =
+        super.getProcessorList(conf);
+    retVal.add(new OpportunisticAMSProcessor());
+    return retVal;
   }
 
   @Override
@@ -364,6 +404,8 @@ public class OpportunisticContainerAllocatorAMService
       break;
     case NODE_LABELS_UPDATE:
       break;
+    case RELEASE_CONTAINER:
+      break;
     // <-- IGNORED EVENTS : END -->
     default:
       LOG.error("Unknown event arrived at" +
@@ -376,7 +418,8 @@ public class OpportunisticContainerAllocatorAMService
     return nodeMonitor.getThresholdCalculator();
   }
 
-  private synchronized List<RemoteNode> getLeastLoadedNodes() {
+  @VisibleForTesting
+  synchronized List<RemoteNode> getLeastLoadedNodes() {
     long currTime = System.currentTimeMillis();
     if ((currTime - lastCacheUpdateTime > cacheRefreshInterval)
         || (cachedNodes == null)) {
@@ -403,8 +446,13 @@ public class OpportunisticContainerAllocatorAMService
   private RemoteNode convertToRemoteNode(NodeId nodeId) {
     SchedulerNode node =
         ((AbstractYarnScheduler) rmContext.getScheduler()).getNode(nodeId);
-    return node != null ? RemoteNode.newInstance(nodeId, node.getHttpAddress())
-        : null;
+    if (node != null) {
+      RemoteNode rNode = RemoteNode.newInstance(nodeId, node.getHttpAddress());
+      rNode.setRackName(node.getRackName());
+      rNode.setNodePartition(node.getPartition());
+      return rNode;
+    }
+    return null;
   }
 
   private static ApplicationAttemptId getAppAttemptId() throws YarnException {

@@ -116,6 +116,7 @@ Usage:
        hdfs getconf -namenodes
        hdfs getconf -secondaryNameNodes
        hdfs getconf -backupNodes
+       hdfs getconf -journalNodes
        hdfs getconf -includeFile
        hdfs getconf -excludeFile
        hdfs getconf -nnRpcAddresses
@@ -126,6 +127,7 @@ Usage:
 | `-namenodes` | gets list of namenodes in the cluster. |
 | `-secondaryNameNodes` | gets list of secondary namenodes in the cluster. |
 | `-backupNodes` | gets list of backup nodes in the cluster. |
+| `-journalNodes` | gets list of journal nodes in the cluster. |
 | `-includeFile` | gets the include file path that defines the datanodes that can join the cluster. |
 | `-excludeFile` | gets the exclude file path that defines the datanodes that need to decommissioned. |
 | `-nnRpcAddresses` | gets the namenode rpc addresses |
@@ -350,6 +352,7 @@ Usage:
         hdfs dfsadmin [-clrSpaceQuota [-storageType <storagetype>] <dirname>...<dirname>]
         hdfs dfsadmin [-finalizeUpgrade]
         hdfs dfsadmin [-rollingUpgrade [<query> |<prepare> |<finalize>]]
+        hdfs dfsadmin [-upgrade [query | finalize]
         hdfs dfsadmin [-refreshServiceAcl]
         hdfs dfsadmin [-refreshUserToGroupsMappings]
         hdfs dfsadmin [-refreshSuperUserGroupsConfiguration]
@@ -370,7 +373,7 @@ Usage:
         hdfs dfsadmin [-getDatanodeInfo <datanode_host:ipc_port>]
         hdfs dfsadmin [-metasave filename]
         hdfs dfsadmin [-triggerBlockReport [-incremental] <datanode_host:ipc_port>]
-        hdfs dfsadmin [-listOpenFiles]
+        hdfs dfsadmin [-listOpenFiles [-blockingDecommission] [-path <path>]]
         hdfs dfsadmin [-help [cmd]]
 
 | COMMAND\_OPTION | Description |
@@ -387,6 +390,7 @@ Usage:
 | `-clrSpaceQuota` `[-storageType <storagetype>]` \<dirname\>...\<dirname\> | See [HDFS Quotas Guide](../hadoop-hdfs/HdfsQuotaAdminGuide.html#Administrative_Commands) for the detail. |
 | `-finalizeUpgrade` | Finalize upgrade of HDFS. Datanodes delete their previous version working directories, followed by Namenode doing the same. This completes the upgrade process. |
 | `-rollingUpgrade` [\<query\>\|\<prepare\>\|\<finalize\>] | See [Rolling Upgrade document](../hadoop-hdfs/HdfsRollingUpgrade.html#dfsadmin_-rollingUpgrade) for the detail. |
+| `-upgrade` query\|finalize | Query the current upgrade status.<br/>Finalize upgrade of HDFS (equivalent to -finalizeUpgrade). |
 | `-refreshServiceAcl` | Reload the service-level authorization policy file. |
 | `-refreshUserToGroupsMappings` | Refresh user-to-groups mappings. |
 | `-refreshSuperUserGroupsConfiguration` | Refresh superuser proxy groups mappings |
@@ -407,10 +411,45 @@ Usage:
 | `-getDatanodeInfo` \<datanode\_host:ipc\_port\> | Get the information about the given datanode. See [Rolling Upgrade document](./HdfsRollingUpgrade.html#dfsadmin_-getDatanodeInfo) for the detail. |
 | `-metasave` filename | Save Namenode's primary data structures to *filename* in the directory specified by hadoop.log.dir property. *filename* is overwritten if it exists. *filename* will contain one line for each of the following<br/>1. Datanodes heart beating with Namenode<br/>2. Blocks waiting to be replicated<br/>3. Blocks currently being replicated<br/>4. Blocks waiting to be deleted |
 | `-triggerBlockReport` `[-incremental]` \<datanode\_host:ipc\_port\> | Trigger a block report for the given datanode. If 'incremental' is specified, it will be otherwise, it will be a full block report. |
-| `-listOpenFiles` | List all open files currently managed by the NameNode along with client name and client machine accessing them. |
+| `-listOpenFiles` `[-blockingDecommission]` `[-path <path>]` | List all open files currently managed by the NameNode along with client name and client machine accessing them. Open files list will be filtered by given type and path. |
 | `-help` [cmd] | Displays help for the given command or all commands if none is specified. |
 
 Runs a HDFS dfsadmin client.
+
+### `dfsrouter`
+
+Usage: `hdfs dfsrouter`
+
+Runs the DFS router. See [Router](../hadoop-hdfs-rbf/HDFSRouterFederation.html#Router) for more info.
+
+### `dfsrouteradmin`
+
+Usage:
+
+      hdfs dfsrouteradmin
+          [-add <source> <nameservice1, nameservice2, ...> <destination> [-readonly] [-order HASH|LOCAL|RANDOM|HASH_ALL] -owner <owner> -group <group> -mode <mode>]
+          [-update <source> <nameservice1, nameservice2, ...> <destination> [-readonly] [-order HASH|LOCAL|RANDOM|HASH_ALL] -owner <owner> -group <group> -mode <mode>]
+          [-rm <source>]
+          [-ls <path>]
+          [-setQuota <path> -nsQuota <nsQuota> -ssQuota <quota in bytes or quota size string>]
+          [-clrQuota <path>]
+          [-safemode enter | leave | get]
+          [-nameservice disable | enable <nameservice>]
+          [-getDisabledNameservices]
+
+| COMMAND\_OPTION | Description |
+|:---- |:---- |
+| `-add` *source* *nameservices* *destination* | Add a mount table entry or update if it exists. |
+| `-update` *source* *nameservices* *destination* | Update a mount table entry or create one if it does not exist. |
+| `-rm` *source* | Remove mount point of specified path. |
+| `-ls` *path* | List mount points under specified path. |
+| `-setQuota` *path* `-nsQuota` *nsQuota* `-ssQuota` *ssQuota* | Set quota for specified path. See [HDFS Quotas Guide](./HdfsQuotaAdminGuide.html) for the quota detail. |
+| `-clrQuota` *path* | Clear quota of given mount point. See [HDFS Quotas Guide](./HdfsQuotaAdminGuide.html) for the quota detail. |
+| `-safemode` `enter` `leave` `get` | Manually set the Router entering or leaving safe mode. The option *get* will be used for verifying if the Router is in safe mode state. |
+| `-nameservice` `disable` `enable` *nameservice* | Disable/enable  a name service from the federation. If disabled, requests will not go to that name service. |
+| `-getDisabledNameservices` | Get the name services that are disabled in the federation. |
+
+The commands for managing Router-based federation. See [Mount table management](../hadoop-hdfs-rbf/HDFSRouterFederation.html#Mount_table_management) for more info.
 
 ### `diskbalancer`
 
@@ -530,7 +569,7 @@ Usage:
 |:---- |:---- |
 | `-backup` | Start backup node. |
 | `-checkpoint` | Start checkpoint node. |
-| `-format` `[-clusterid cid]` `[-force]` `[-nonInteractive]` | Formats the specified NameNode. It starts the NameNode, formats it and then shut it down. -force option formats if the name directory exists. -nonInteractive option aborts if the name directory exists, unless -force option is specified. |
+| `-format` `[-clusterid cid]` | Formats the specified NameNode. It starts the NameNode, formats it and then shut it down. Will throw NameNodeFormatException if name dir already exist and if reformat is disabled for cluster. |
 | `-upgrade` `[-clusterid cid]` [`-renameReserved` \<k-v pairs\>] | Namenode should be started with upgrade option after the distribution of new Hadoop version. |
 | `-upgradeOnly` `[-clusterid cid]` [`-renameReserved` \<k-v pairs\>] | Upgrade the specified NameNode and then shutdown it. |
 | `-rollback` | Rollback the NameNode to the previous version. This should be used after stopping the cluster and distributing the old Hadoop version. |
@@ -576,6 +615,8 @@ Usage:
           [-setStoragePolicy -path <path> -policy <policy>]
           [-getStoragePolicy -path <path>]
           [-unsetStoragePolicy -path <path>]
+          [-satisfyStoragePolicy -path <path>]
+          [-isSatisfierRunning]
           [-help <command-name>]
 
 Lists out all/Gets/sets/unsets storage policies. See the [HDFS Storage Policy Documentation](./ArchivalStorage.html) for more information.

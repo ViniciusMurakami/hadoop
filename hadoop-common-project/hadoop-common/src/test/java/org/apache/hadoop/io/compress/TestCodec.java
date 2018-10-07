@@ -49,8 +49,6 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 import org.apache.commons.codec.binary.Base64;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.CommonConfigurationKeys;
 import org.apache.hadoop.fs.FileStatus;
@@ -81,10 +79,12 @@ import org.junit.After;
 import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class TestCodec {
 
-  private static final Log LOG= LogFactory.getLog(TestCodec.class);
+  private static final Logger LOG= LoggerFactory.getLogger(TestCodec.class);
 
   private Configuration conf = new Configuration();
   private int count = 10000;
@@ -362,11 +362,10 @@ public class TestCodec {
     final Path file = new Path(wd, "test" + codec.getDefaultExtension());
     final byte[] b = new byte[REC_SIZE];
     final Base64 b64 = new Base64(0, null);
-    DataOutputStream fout = null;
     Compressor cmp = CodecPool.getCompressor(codec);
-    try {
-      fout = new DataOutputStream(codec.createOutputStream(
-            fs.create(file, true), cmp));
+    try (DataOutputStream fout =
+             new DataOutputStream(codec.createOutputStream(fs.create(file,
+                 true), cmp))) {
       final DataOutputBuffer dob = new DataOutputBuffer(REC_SIZE * 4 / 3 + 4);
       int seq = 0;
       while (infLen > 0) {
@@ -382,7 +381,6 @@ public class TestCodec {
       }
       LOG.info("Wrote " + seq + " records to " + file);
     } finally {
-      IOUtils.cleanup(LOG, fout);
       CodecPool.returnCompressor(cmp);
     }
     return file;

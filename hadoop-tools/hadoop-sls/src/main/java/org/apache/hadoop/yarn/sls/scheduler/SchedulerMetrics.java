@@ -32,7 +32,6 @@ import java.util.List;
 import java.util.SortedMap;
 import java.util.Locale;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.Lock;
@@ -48,6 +47,7 @@ import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.classification.InterfaceStability.Unstable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.util.ReflectionUtils;
+import org.apache.hadoop.util.concurrent.HadoopScheduledThreadPoolExecutor;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.AbstractYarnScheduler;
@@ -89,11 +89,15 @@ public abstract class SchedulerMetrics {
 
   // counters for scheduler allocate/handle operations
   private Counter schedulerAllocateCounter;
+  private Counter schedulerCommitSuccessCounter;
+  private Counter schedulerCommitFailureCounter;
   private Counter schedulerHandleCounter;
   private Map<SchedulerEventType, Counter> schedulerHandleCounterMap;
 
   // Timers for scheduler allocate/handle operations
   private Timer schedulerAllocateTimer;
+  private Timer schedulerCommitSuccessTimer;
+  private Timer schedulerCommitFailureTimer;
   private Timer schedulerHandleTimer;
   private Map<SchedulerEventType, Timer> schedulerHandleTimerMap;
   private List<Histogram> schedulerHistogramList;
@@ -165,7 +169,7 @@ public abstract class SchedulerMetrics {
     web.start();
 
     // a thread to update histogram timer
-    pool = new ScheduledThreadPoolExecutor(2);
+    pool = new HadoopScheduledThreadPoolExecutor(2);
     pool.scheduleAtFixedRate(new HistogramsRunnable(), 0, 1000,
         TimeUnit.MILLISECONDS);
 
@@ -234,14 +238,35 @@ public abstract class SchedulerMetrics {
     }
   }
 
-  public abstract void trackQueue(String queueName);
-  
-  public void untrackQueue(String queueName) {
-    for (String m : queueTrackedMetrics) {
-      metrics.remove("variable.queue." + queueName + "." + m);
+  /**
+   * Track a queue by registering its metrics.
+   *
+   * @param queue queue name
+   */
+  public void trackQueue(String queue) {
+    queueLock.lock();
+    try {
+      if (!isTracked(queue)) {
+        trackedQueues.add(queue);
+        registerQueueMetrics(queue);
+      }
+    } finally {
+      queueLock.unlock();
     }
   }
-  
+
+  protected void registerQueueMetrics(String queueName) {
+    SortedMap<String, Counter> counterMap = metrics.getCounters();
+
+    for (QueueMetric queueMetric : QueueMetric.values()) {
+      String metricName = getQueueMetricName(queueName, queueMetric);
+      if (!counterMap.containsKey(metricName)) {
+        metrics.counter(metricName);
+        queueTrackedMetrics.add(metricName);
+      }
+    }
+  }
+
   public boolean isTracked(String queueName) {
     return trackedQueues.contains(queueName);
   }
@@ -366,6 +391,10 @@ public abstract class SchedulerMetrics {
       // counters for scheduler operations
       schedulerAllocateCounter = metrics.counter(
           "counter.scheduler.operation.allocate");
+      schedulerCommitSuccessCounter = metrics.counter(
+          "counter.scheduler.operation.commit.success");
+      schedulerCommitFailureCounter = metrics.counter(
+          "counter.scheduler.operation.commit.failure");
       schedulerHandleCounter = metrics.counter(
           "counter.scheduler.operation.handle");
       schedulerHandleCounterMap = new HashMap<>();
@@ -379,6 +408,10 @@ public abstract class SchedulerMetrics {
           SLSConfiguration.METRICS_TIMER_WINDOW_SIZE,
           SLSConfiguration.METRICS_TIMER_WINDOW_SIZE_DEFAULT);
       schedulerAllocateTimer = new Timer(
+          new SlidingWindowReservoir(timeWindowSize));
+      schedulerCommitSuccessTimer = new Timer(
+          new SlidingWindowReservoir(timeWindowSize));
+      schedulerCommitFailureTimer = new Timer(
           new SlidingWindowReservoir(timeWindowSize));
       schedulerHandleTimer = new Timer(
           new SlidingWindowReservoir(timeWindowSize));
@@ -396,6 +429,20 @@ public abstract class SchedulerMetrics {
           schedulerAllocateHistogram);
       schedulerHistogramList.add(schedulerAllocateHistogram);
       histogramTimerMap.put(schedulerAllocateHistogram, schedulerAllocateTimer);
+      Histogram schedulerCommitHistogram = new Histogram(
+          new SlidingWindowReservoir(SAMPLING_SIZE));
+      metrics.register("sampler.scheduler.operation.commit.success.timecost",
+          schedulerCommitHistogram);
+      schedulerHistogramList.add(schedulerCommitHistogram);
+      histogramTimerMap
+          .put(schedulerCommitHistogram, schedulerCommitSuccessTimer);
+      Histogram schedulerCommitFailureHistogram =
+          new Histogram(new SlidingWindowReservoir(SAMPLING_SIZE));
+      metrics.register("sampler.scheduler.operation.commit.failure.timecost",
+          schedulerCommitFailureHistogram);
+      schedulerHistogramList.add(schedulerCommitFailureHistogram);
+      histogramTimerMap
+          .put(schedulerCommitFailureHistogram, schedulerCommitFailureTimer);
       Histogram schedulerHandleHistogram = new Histogram(
           new SlidingWindowReservoir(SAMPLING_SIZE));
       metrics.register("sampler.scheduler.operation.handle.timecost",
@@ -471,7 +518,8 @@ public abstract class SchedulerMetrics {
 
     @Override
     public void run() {
-      if(running) {
+      SchedulerWrapper wrapper = (SchedulerWrapper) scheduler;
+      if(running && wrapper.getTracker().getQueueSet() != null) {
         // all WebApp to get real tracking json
         String trackingMetrics = web.generateRealTimeTrackingMetrics();
         // output
@@ -513,6 +561,14 @@ public abstract class SchedulerMetrics {
     schedulerAllocateCounter.inc();
   }
 
+  void increaseSchedulerCommitSuccessCounter() {
+    schedulerCommitSuccessCounter.inc();
+  }
+
+  void increaseSchedulerCommitFailureCounter() {
+    schedulerCommitFailureCounter.inc();
+  }
+
   void increaseSchedulerHandleCounter(SchedulerEventType schedulerEventType) {
     schedulerHandleCounter.inc();
     schedulerHandleCounterMap.get(schedulerEventType).inc();
@@ -520,6 +576,14 @@ public abstract class SchedulerMetrics {
 
   Timer getSchedulerAllocateTimer() {
     return schedulerAllocateTimer;
+  }
+
+  Timer getSchedulerCommitSuccessTimer() {
+    return schedulerCommitSuccessTimer;
+  }
+
+  Timer getSchedulerCommitFailureTimer() {
+    return schedulerCommitFailureTimer;
   }
 
   Timer getSchedulerHandleTimer() {
@@ -547,40 +611,13 @@ public abstract class SchedulerMetrics {
     return "counter.queue." + queue + "." + metric.value;
   }
 
-  private void traceQueueIfNotTraced(String queue) {
-    queueLock.lock();
-    try {
-      if (!isTracked(queue)) {
-        trackQueue(queue);
-      }
-    } finally {
-      queueLock.unlock();
-    }
-  }
-
-  void initQueueMetric(String queueName){
-    SortedMap<String, Counter> counterMap = metrics.getCounters();
-
-    for (QueueMetric queueMetric : QueueMetric.values()) {
-      String metricName = getQueueMetricName(queueName, queueMetric);
-      if (!counterMap.containsKey(metricName)) {
-        metrics.counter(metricName);
-        counterMap = metrics.getCounters();
-      }
-    }
-
-    traceQueueIfNotTraced(queueName);
-  }
-
   void updateQueueMetrics(Resource pendingResource, Resource allocatedResource,
       String queueName) {
+    trackQueue(queueName);
+
     SortedMap<String, Counter> counterMap = metrics.getCounters();
     for(QueueMetric metric : QueueMetric.values()) {
       String metricName = getQueueMetricName(queueName, metric);
-      if (!counterMap.containsKey(metricName)) {
-        metrics.counter(metricName);
-        counterMap = metrics.getCounters();
-      }
 
       if (metric == QueueMetric.PENDING_MEMORY) {
         counterMap.get(metricName).inc(pendingResource.getMemorySize());
@@ -592,8 +629,6 @@ public abstract class SchedulerMetrics {
         counterMap.get(metricName).inc(allocatedResource.getVirtualCores());
       }
     }
-
-    traceQueueIfNotTraced(queueName);
   }
 
   void updateQueueMetricsByRelease(Resource releaseResource, String queue) {

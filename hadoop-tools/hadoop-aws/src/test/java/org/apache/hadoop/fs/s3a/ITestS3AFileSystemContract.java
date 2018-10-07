@@ -27,6 +27,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystemContractBaseTest;
 import org.apache.hadoop.fs.Path;
+
 import static org.junit.Assume.*;
 import static org.junit.Assert.*;
 
@@ -51,6 +52,11 @@ public class ITestS3AFileSystemContract extends FileSystemContractBaseTest {
 
   private void nameThread() {
     Thread.currentThread().setName("JUnit-" + methodName.getMethodName());
+  }
+
+  @Override
+  protected int getGlobalTimeout() {
+    return S3ATestConstants.S3A_TEST_TIMEOUT;
   }
 
   @Before

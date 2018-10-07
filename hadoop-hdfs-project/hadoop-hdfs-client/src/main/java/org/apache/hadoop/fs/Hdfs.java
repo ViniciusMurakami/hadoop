@@ -115,6 +115,14 @@ public class Hdfs extends AbstractFileSystem {
     return dfs.delete(getUriPath(f), recursive);
   }
 
+  /**
+   * The returned BlockLocation will have different formats for replicated
+   * and erasure coded file.
+   *
+   * Please refer to
+   * {@link FileContext#getFileBlockLocations(Path, long, long)}
+   * for more details.
+   */
   @Override
   public BlockLocation[] getFileBlockLocations(Path p, long start, long len)
       throws IOException, UnresolvedLinkException {
@@ -122,9 +130,9 @@ public class Hdfs extends AbstractFileSystem {
   }
 
   @Override
-  public FileChecksum getFileChecksum(Path f) 
+  public FileChecksum getFileChecksum(Path f)
       throws IOException, UnresolvedLinkException {
-    return dfs.getFileChecksum(getUriPath(f), Long.MAX_VALUE);
+    return dfs.getFileChecksumWithCombineMode(getUriPath(f), Long.MAX_VALUE);
   }
 
   @Override
@@ -165,6 +173,13 @@ public class Hdfs extends AbstractFileSystem {
     return dfs.getServerDefaults();
   }
 
+  /**
+   * The BlockLocation of returned LocatedFileStatus will have different
+   * formats for replicated and erasure coded file.
+   * Please refer to
+   * {@link FileContext#getFileBlockLocations(Path, long, long)} for
+   * more details.
+   */
   @Override
   public RemoteIterator<LocatedFileStatus> listLocatedStatus(
       final Path p)

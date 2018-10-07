@@ -59,7 +59,7 @@ public class MemoryRMStateStore extends RMStateStore {
   @Override
   public synchronized long getAndIncrementEpoch() throws Exception {
     long currentEpoch = epoch;
-    epoch = epoch + 1;
+    epoch = nextEpoch(epoch);
     return currentEpoch;
   }
 
@@ -83,6 +83,7 @@ public class MemoryRMStateStore extends RMStateStore {
   
   @Override
   public synchronized void initInternal(Configuration conf) {
+    epoch = baseEpoch;
   }
 
   @Override

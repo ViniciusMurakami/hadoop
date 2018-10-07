@@ -26,8 +26,6 @@ import java.net.URLDecoder;
 import java.util.ArrayList;
 import java.util.Vector;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
@@ -41,11 +39,14 @@ import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.ChannelSftp.LsEntry;
 import com.jcraft.jsch.SftpATTRS;
 import com.jcraft.jsch.SftpException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** SFTP FileSystem. */
 public class SFTPFileSystem extends FileSystem {
 
-  public static final Log LOG = LogFactory.getLog(SFTPFileSystem.class);
+  public static final Logger LOG =
+      LoggerFactory.getLogger(SFTPFileSystem.class);
 
   private SFTPConnectionPool connectionPool;
   private URI uri;
@@ -325,8 +326,10 @@ public class SFTPFileSystem extends FileSystem {
         String parentDir = parent.toUri().getPath();
         boolean succeeded = true;
         try {
+          final String previousCwd = client.pwd();
           client.cd(parentDir);
           client.mkdir(pathName);
+          client.cd(previousCwd);
         } catch (SftpException e) {
           throw new IOException(String.format(E_MAKE_DIR_FORPATH, pathName,
               parentDir));
@@ -473,8 +476,10 @@ public class SFTPFileSystem extends FileSystem {
     }
     boolean renamed = true;
     try {
+      final String previousCwd = channel.pwd();
       channel.cd("/");
       channel.rename(src.toUri().getPath(), dst.toUri().getPath());
+      channel.cd(previousCwd);
     } catch (SftpException e) {
       renamed = false;
     }
@@ -557,8 +562,10 @@ public class SFTPFileSystem extends FileSystem {
     }
     OutputStream os;
     try {
+      final String previousCwd = client.pwd();
       client.cd(parent.toUri().getPath());
       os = client.put(f.getName());
+      client.cd(previousCwd);
     } catch (SftpException e) {
       throw new IOException(e);
     }

@@ -22,10 +22,10 @@ import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Public;
 import org.apache.hadoop.classification.InterfaceStability.Evolving;
 import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * This class contains a set of methods to work with services, especially
@@ -34,7 +34,8 @@ import org.slf4j.Logger;
 @Public
 @Evolving
 public final class ServiceOperations {
-  private static final Log LOG = LogFactory.getLog(AbstractService.class);
+  private static final Logger LOG =
+      LoggerFactory.getLogger(AbstractService.class);
 
   private ServiceOperations() {
   }
@@ -80,9 +81,7 @@ public final class ServiceOperations {
     try {
       stop(service);
     } catch (Exception e) {
-      log.warn("When stopping the service " + service.getName()
-               + " : " + e,
-               e);
+      log.warn("When stopping the service " + service.getName(), e);
       return e;
     }
     return null;
@@ -102,7 +101,7 @@ public final class ServiceOperations {
     try {
       stop(service);
     } catch (Exception e) {
-      log.warn("When stopping the service {} : {}", service.getName(), e, e);
+      log.warn("When stopping the service {}", service.getName(), e);
       return e;
     }
     return null;

@@ -36,7 +36,7 @@ import java.util.TimeZone;
 import java.util.List;
 import org.apache.commons.codec.DecoderException;
 import org.apache.commons.codec.net.URLCodec;
-import org.apache.commons.lang.NotImplementedException;
+import org.apache.commons.lang3.NotImplementedException;
 import org.apache.http.client.utils.URIBuilder;
 
 import com.microsoft.azure.storage.AccessCondition;
@@ -339,7 +339,7 @@ public class MockStorageInterface extends StorageInterface {
 
     @Override
     public StorageUri getStorageUri() {
-      throw new NotImplementedException();
+      throw new NotImplementedException("Code is not implemented");
     }
   }
 
@@ -425,7 +425,14 @@ public class MockStorageInterface extends StorageInterface {
 
     @Override
     public void startCopyFromBlob(CloudBlobWrapper sourceBlob, BlobRequestOptions options,
-        OperationContext opContext) throws StorageException, URISyntaxException {
+        OperationContext opContext, boolean overwriteDestination) throws StorageException, URISyntaxException {
+      if (!overwriteDestination && backingStore.exists(convertUriToDecodedString(uri))) {
+        throw new StorageException("BlobAlreadyExists",
+            "The blob already exists.",
+            HttpURLConnection.HTTP_CONFLICT,
+            null,
+            null);
+      }
       backingStore.copy(convertUriToDecodedString(sourceBlob.getUri()), convertUriToDecodedString(uri));
       //TODO: set the backingStore.properties.CopyState and
       //      update azureNativeFileSystemStore.waitForCopyToComplete
@@ -551,7 +558,8 @@ public class MockStorageInterface extends StorageInterface {
       throw new UnsupportedOperationException("downloadBlockList not used in Mock Tests");
     }
     @Override
-    public void uploadBlock(String blockId, InputStream sourceStream,
+    public void uploadBlock(String blockId, AccessCondition accessCondition,
+        InputStream sourceStream,
         long length, BlobRequestOptions options,
         OperationContext opContext) throws IOException, StorageException {
       throw new UnsupportedOperationException("uploadBlock not used in Mock Tests");
@@ -582,20 +590,20 @@ public class MockStorageInterface extends StorageInterface {
     @Override
     public void create(long length, BlobRequestOptions options,
         OperationContext opContext) throws StorageException {
-      throw new NotImplementedException();
+      throw new NotImplementedException("Code is not implemented");
     }
 
     @Override
     public void uploadPages(InputStream sourceStream, long offset, long length,
         BlobRequestOptions options, OperationContext opContext)
         throws StorageException, IOException {
-      throw new NotImplementedException();
+      throw new NotImplementedException("Code is not implemented");
     }
 
     @Override
     public ArrayList<PageRange> downloadPageRanges(BlobRequestOptions options,
         OperationContext opContext) throws StorageException {
-      throw new NotImplementedException();
+      throw new NotImplementedException("Code is not implemented");
     }
 
     @Override
@@ -614,7 +622,7 @@ public class MockStorageInterface extends StorageInterface {
 
     @Override
     public StorageUri getStorageUri() {
-        throw new NotImplementedException();
+        throw new NotImplementedException("Code is not implemented");
     }
 
     @Override

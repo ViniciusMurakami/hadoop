@@ -18,6 +18,7 @@
 # be done outside of a function
 declare -a HADOOP_SUBCMD_USAGE
 declare -a HADOOP_OPTION_USAGE
+declare -a HADOOP_SUBCMD_USAGE_TYPES
 
 ## @description  Print a message to stderr
 ## @audience     public
@@ -113,6 +114,89 @@ function hadoop_verify_entry
   # so if this changes, be aware that unit tests effectively
   # do this function in them
   [[ ${!1} =~ \ ${2}\  ]]
+}
+
+## @description  Check if an array has a given value
+## @audience     public
+## @stability    stable
+## @replaceable  yes
+## @param        element
+## @param        array
+## @returns      0 = yes
+## @returns      1 = no
+function hadoop_array_contains
+{
+  declare element=$1
+  shift
+  declare val
+
+  if [[ "$#" -eq 0 ]]; then
+    return 1
+  fi
+
+  for val in "${@}"; do
+    if [[ "${val}" == "${element}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+## @description  Add the `appendstring` if `checkstring` is not
+## @description  present in the given array
+## @audience     public
+## @stability    stable
+## @replaceable  yes
+## @param        envvar
+## @param        appendstring
+function hadoop_add_array_param
+{
+  declare arrname=$1
+  declare add=$2
+
+  declare arrref="${arrname}[@]"
+  declare array=("${!arrref}")
+
+  if ! hadoop_array_contains "${add}" "${array[@]}"; then
+    #shellcheck disable=SC1083,SC2086
+    eval ${arrname}=\(\"\${array[@]}\" \"${add}\" \)
+    hadoop_debug "$1 accepted $2"
+  else
+    hadoop_debug "$1 declined $2"
+  fi
+}
+
+## @description  Sort an array (must not contain regexps)
+## @description  present in the given array
+## @audience     public
+## @stability    stable
+## @replaceable  yes
+## @param        arrayvar
+function hadoop_sort_array
+{
+  declare arrname=$1
+  declare arrref="${arrname}[@]"
+  declare array=("${!arrref}")
+  declare oifs
+
+  declare globstatus
+  declare -a sa
+
+  globstatus=$(set -o | grep noglob | awk '{print $NF}')
+
+  set -f
+  oifs=${IFS}
+
+  # shellcheck disable=SC2034
+  IFS=$'\n' sa=($(sort <<<"${array[*]}"))
+
+  # shellcheck disable=SC1083
+  eval "${arrname}"=\(\"\${sa[@]}\"\)
+
+  IFS=${oifs}
+  if [[ "${globstatus}" = off ]]; then
+    set +f
+  fi
 }
 
 ## @description  Check if we are running with priv
@@ -220,13 +304,20 @@ function hadoop_uservar_su
 ## @stability    evolving
 ## @replaceable  no
 ## @param        subcommand
+## @param        subcommandtype
 ## @param        subcommanddesc
 function hadoop_add_subcommand
 {
-  local subcmd=$1
-  local text=$2
+  declare subcmd=$1
+  declare subtype=$2
+  declare text=$3
 
-  HADOOP_SUBCMD_USAGE[${HADOOP_SUBCMD_USAGE_COUNTER}]="${subcmd}@${text}"
+  hadoop_debug "${subcmd} as a ${subtype}"
+
+  hadoop_add_array_param HADOOP_SUBCMD_USAGE_TYPES "${subtype}"
+
+  # done in this order so that sort works later
+  HADOOP_SUBCMD_USAGE[${HADOOP_SUBCMD_USAGE_COUNTER}]="${subcmd}@${subtype}@${text}"
   ((HADOOP_SUBCMD_USAGE_COUNTER=HADOOP_SUBCMD_USAGE_COUNTER+1))
 }
 
@@ -253,17 +344,22 @@ function hadoop_reset_usage
 {
   HADOOP_SUBCMD_USAGE=()
   HADOOP_OPTION_USAGE=()
+  HADOOP_SUBCMD_USAGE_TYPES=()
   HADOOP_SUBCMD_USAGE_COUNTER=0
   HADOOP_OPTION_USAGE_COUNTER=0
 }
 
 ## @description  Print a screen-size aware two-column output
+## @description  if reqtype is not null, only print those requested
 ## @audience     private
 ## @stability    evolving
 ## @replaceable  no
+## @param        reqtype
 ## @param        array
 function hadoop_generic_columnprinter
 {
+  declare reqtype=$1
+  shift
   declare -a input=("$@")
   declare -i i=0
   declare -i counter=0
@@ -275,11 +371,13 @@ function hadoop_generic_columnprinter
   declare -i foldsize
   declare -a tmpa
   declare numcols
+  declare brup
 
   if [[ -n "${COLUMNS}" ]]; then
     numcols=${COLUMNS}
   else
     numcols=$(tput cols) 2>/dev/null
+    COLUMNS=${numcols}
   fi
 
   if [[ -z "${numcols}"
@@ -292,7 +390,8 @@ function hadoop_generic_columnprinter
   while read -r line; do
     tmpa[${counter}]=${line}
     ((counter=counter+1))
-    option=$(echo "${line}" | cut -f1 -d'@')
+    IFS='@' read -ra brup <<< "${line}"
+    option="${brup[0]}"
     if [[ ${#option} -gt ${maxoptsize} ]]; then
       maxoptsize=${#option}
     fi
@@ -304,8 +403,22 @@ function hadoop_generic_columnprinter
   ((foldsize=numcols-maxoptsize))
 
   until [[ $i -eq ${#tmpa[@]} ]]; do
-    option=$(echo "${tmpa[$i]}" | cut -f1 -d'@')
-    giventext=$(echo "${tmpa[$i]}" | cut -f2 -d'@')
+    IFS='@' read -ra brup <<< "${tmpa[$i]}"
+
+    option="${brup[0]}"
+    cmdtype="${brup[1]}"
+    giventext="${brup[2]}"
+
+    if [[ -n "${reqtype}" ]]; then
+      if [[ "${cmdtype}" != "${reqtype}" ]]; then
+        ((i=i+1))
+        continue
+      fi
+    fi
+
+    if [[ -z "${giventext}" ]]; then
+      giventext=${cmdtype}
+    fi
 
     while read -r line; do
       printf "%-${maxoptsize}s   %-s\n" "${option}" "${line}"
@@ -325,13 +438,14 @@ function hadoop_generic_columnprinter
 ## @param        [text to use in place of SUBCOMMAND]
 function hadoop_generate_usage
 {
-  local cmd=$1
-  local takesclass=$2
-  local subcmdtext=${3:-"SUBCOMMAND"}
-  local haveoptions
-  local optstring
-  local havesubs
-  local subcmdstring
+  declare cmd=$1
+  declare takesclass=$2
+  declare subcmdtext=${3:-"SUBCOMMAND"}
+  declare haveoptions
+  declare optstring
+  declare havesubs
+  declare subcmdstring
+  declare cmdtype
 
   cmd=${cmd##*/}
 
@@ -358,7 +472,7 @@ function hadoop_generate_usage
     echo "  OPTIONS is none or any of:"
     echo ""
 
-    hadoop_generic_columnprinter "${HADOOP_OPTION_USAGE[@]}"
+    hadoop_generic_columnprinter "" "${HADOOP_OPTION_USAGE[@]}"
   fi
 
   if [[ "${havesubs}" = true ]]; then
@@ -366,7 +480,18 @@ function hadoop_generate_usage
     echo "  ${subcmdtext} is one of:"
     echo ""
 
-    hadoop_generic_columnprinter "${HADOOP_SUBCMD_USAGE[@]}"
+    if [[ "${#HADOOP_SUBCMD_USAGE_TYPES[@]}" -gt 0 ]]; then
+
+      hadoop_sort_array HADOOP_SUBCMD_USAGE_TYPES
+      for subtype in "${HADOOP_SUBCMD_USAGE_TYPES[@]}"; do
+        #shellcheck disable=SC2086
+        cmdtype="$(tr '[:lower:]' '[:upper:]' <<< ${subtype:0:1})${subtype:1}"
+        printf "\n    %s Commands:\n\n" "${cmdtype}"
+        hadoop_generic_columnprinter "${subtype}" "${HADOOP_SUBCMD_USAGE[@]}"
+      done
+    else
+      hadoop_generic_columnprinter "" "${HADOOP_SUBCMD_USAGE[@]}"
+    fi
     echo ""
     echo "${subcmdtext} may print help when invoked w/o parameters or with -h."
   fi
@@ -471,6 +596,12 @@ function hadoop_bootstrap
   YARN_LIB_JARS_DIR=${YARN_LIB_JARS_DIR:-"share/hadoop/yarn/lib"}
   MAPRED_DIR=${MAPRED_DIR:-"share/hadoop/mapreduce"}
   MAPRED_LIB_JARS_DIR=${MAPRED_LIB_JARS_DIR:-"share/hadoop/mapreduce/lib"}
+  HDDS_DIR=${HDDS_DIR:-"share/hadoop/hdds"}
+  HDDS_LIB_JARS_DIR=${HDDS_LIB_JARS_DIR:-"share/hadoop/hdds/lib"}
+  OZONE_DIR=${OZONE_DIR:-"share/hadoop/ozone"}
+  OZONE_LIB_JARS_DIR=${OZONE_LIB_JARS_DIR:-"share/hadoop/ozone/lib"}
+  OZONEFS_DIR=${OZONEFS_DIR:-"share/hadoop/ozonefs"}
+
   HADOOP_TOOLS_HOME=${HADOOP_TOOLS_HOME:-${HADOOP_HOME}}
   HADOOP_TOOLS_DIR=${HADOOP_TOOLS_DIR:-"share/hadoop/tools"}
   HADOOP_TOOLS_LIB_JARS_DIR=${HADOOP_TOOLS_LIB_JARS_DIR:-"${HADOOP_TOOLS_DIR}/lib"}
@@ -1600,11 +1731,16 @@ function hadoop_status_daemon
   shift
 
   local pid
+  local pspid
 
   if [[ -f "${pidfile}" ]]; then
     pid=$(cat "${pidfile}")
-    if ps -p "${pid}" > /dev/null 2>&1; then
-      return 0
+    if pspid=$(ps -o args= -p"${pid}" 2>/dev/null); then
+      # this is to check that the running process we found is actually the same
+      # daemon that we're interested in
+      if [[ ${pspid} =~ -Dproc_${daemonname} ]]; then
+        return 0
+      fi
     fi
     return 1
   fi
@@ -1873,11 +2009,9 @@ function hadoop_start_secure_daemon_wrapper
     (( counter++ ))
   done
 
-  # this is for the daemon pid creation
   #shellcheck disable=SC2086
-  echo $! > "${jsvcpidfile}" 2>/dev/null
-  if [[ $? -gt 0 ]]; then
-    hadoop_error "ERROR:  Cannot write ${daemonname} pid ${daemonpidfile}."
+  if ! echo $! > "${jsvcpidfile}"; then
+    hadoop_error "ERROR:  Cannot write ${daemonname} pid ${jsvcpidfile}."
   fi
 
   sleep 1
@@ -1907,6 +2041,35 @@ function hadoop_start_secure_daemon_wrapper
   return 0
 }
 
+## @description  Wait till process dies or till timeout
+## @audience     private
+## @stability    evolving
+## @param        pid
+## @param        timeout
+function wait_process_to_die_or_timeout
+{
+  local pid=$1
+  local timeout=$2
+
+  # Normalize timeout
+  # Round up or down
+  timeout=$(printf "%.0f\n" "${timeout}")
+  if [[ ${timeout} -lt 1  ]]; then
+    # minimum 1 second
+    timeout=1
+  fi
+
+  # Wait to see if it's still alive
+  for (( i=0; i < "${timeout}"; i++ ))
+  do
+    if kill -0 "${pid}" > /dev/null 2>&1; then
+      sleep 1
+    else
+      break
+    fi
+  done
+}
+
 ## @description  Stop the non-privileged `command` daemon with that
 ## @description  that is running at `pidfile`.
 ## @audience     public
@@ -1927,11 +2090,14 @@ function hadoop_stop_daemon
     pid=$(cat "$pidfile")
 
     kill "${pid}" >/dev/null 2>&1
-    sleep "${HADOOP_STOP_TIMEOUT}"
+
+    wait_process_to_die_or_timeout "${pid}" "${HADOOP_STOP_TIMEOUT}"
+
     if kill -0 "${pid}" > /dev/null 2>&1; then
       hadoop_error "WARNING: ${cmd} did not stop gracefully after ${HADOOP_STOP_TIMEOUT} seconds: Trying to kill with kill -9"
       kill -9 "${pid}" >/dev/null 2>&1
     fi
+    wait_process_to_die_or_timeout "${pid}" "${HADOOP_STOP_TIMEOUT}"
     if ps -p "${pid}" > /dev/null 2>&1; then
       hadoop_error "ERROR: Unable to kill ${pid}"
     else
@@ -2453,29 +2619,6 @@ function hadoop_parse_args
   done
 
   hadoop_debug "hadoop_parse: asking caller to skip ${HADOOP_PARSE_COUNTER}"
-}
-
-## @description  XML-escapes the characters (&'"<>) in the given parameter.
-## @audience     private
-## @stability    evolving
-## @replaceable  yes
-## @param        string
-## @return       XML-escaped string
-function hadoop_xml_escape
-{
-  sed -e 's/&/\&amp;/g' -e 's/"/\\\&quot;/g' \
-    -e "s/'/\\\\\&apos;/g" -e 's/</\\\&lt;/g' -e 's/>/\\\&gt;/g' <<< "$1"
-}
-
-## @description  sed-escapes the characters (\/&) in the given parameter.
-## @audience     private
-## @stability    evolving
-## @replaceable  yes
-## @param        string
-## @return       sed-escaped string
-function hadoop_sed_escape
-{
-  sed -e 's/[\/&]/\\&/g' <<< "$1"
 }
 
 ## @description Handle subcommands from main program entries

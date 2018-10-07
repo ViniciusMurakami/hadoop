@@ -53,6 +53,7 @@ import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.ResourceOption;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
+import org.apache.hadoop.yarn.api.records.SchedulingRequest;
 import org.apache.hadoop.yarn.api.records.UpdateContainerError;
 import org.apache.hadoop.yarn.api.records.UpdateContainerRequest;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
@@ -65,8 +66,10 @@ import org.apache.hadoop.yarn.server.resourcemanager.RMAppManagerEventType;
 import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger;
 import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
 import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
+import org.apache.hadoop.yarn.server.resourcemanager.RMCriticalThreadUncaughtExceptionHandler;
 import org.apache.hadoop.yarn.server.resourcemanager.RMServerUtils;
 import org.apache.hadoop.yarn.server.resourcemanager.ResourceManager;
+import org.apache.hadoop.yarn.server.resourcemanager.monitor.SchedulingMonitorManager;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppEventType;
@@ -84,16 +87,19 @@ import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeFinishedContai
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNodeResourceUpdateEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.rmnode.UpdatedContainerInfo;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.activities.ActivitiesManager;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.ContainerRequest;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.QueueEntitlement;
 
 
 
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.ReleaseContainerEvent;
 import org.apache.hadoop.yarn.server.scheduler.OpportunisticContainerContext;
 import org.apache.hadoop.yarn.server.scheduler.SchedulerRequestKey;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
 import org.apache.hadoop.yarn.server.utils.Lock;
 import org.apache.hadoop.yarn.util.Clock;
 import org.apache.hadoop.yarn.util.SystemClock;
+import org.apache.hadoop.yarn.util.resource.ResourceUtils;
 import org.apache.hadoop.yarn.util.resource.Resources;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -122,7 +128,19 @@ public abstract class AbstractYarnScheduler
   protected SchedulerHealth schedulerHealth = new SchedulerHealth();
   protected volatile long lastNodeUpdateTime;
 
+  // timeout to join when we stop this service
+  protected final long THREAD_JOIN_TIMEOUT_MS = 1000;
+
   private volatile Clock clock;
+
+  /**
+   * To enable the update thread, subclasses should set updateInterval to a
+   * positive value during {@link #serviceInit(Configuration)}.
+   */
+  protected long updateInterval = -1L;
+  @VisibleForTesting
+  Thread updateThread;
+  private final Object updateThreadMonitor = new Object();
 
   /*
    * All schedulers which are inheriting AbstractYarnScheduler should use
@@ -148,6 +166,13 @@ public abstract class AbstractYarnScheduler
    *   container finish)
    */
   protected final ReentrantReadWriteLock.WriteLock writeLock;
+
+  // If set to true, then ALL container updates will be automatically sent to
+  // the NM in the next heartbeat.
+  private boolean autoUpdateContainers = false;
+
+  protected SchedulingMonitorManager schedulingMonitorManager =
+      new SchedulingMonitorManager();
 
   /**
    * Construct the service.
@@ -177,12 +202,48 @@ public abstract class AbstractYarnScheduler
         configuredMaximumAllocationWaitTime);
     maxClusterLevelAppPriority = getMaxPriorityFromConf(conf);
     createReleaseCache();
+    autoUpdateContainers =
+        conf.getBoolean(YarnConfiguration.RM_AUTO_UPDATE_CONTAINERS,
+            YarnConfiguration.DEFAULT_RM_AUTO_UPDATE_CONTAINERS);
+
+    if (updateInterval > 0) {
+      updateThread = new UpdateThread();
+      updateThread.setName("SchedulerUpdateThread");
+      updateThread.setUncaughtExceptionHandler(
+          new RMCriticalThreadUncaughtExceptionHandler(rmContext));
+      updateThread.setDaemon(true);
+    }
     super.serviceInit(conf);
+
+  }
+
+  @Override
+  protected void serviceStart() throws Exception {
+    if (updateThread != null) {
+      updateThread.start();
+    }
+    schedulingMonitorManager.startAll();
+    super.serviceStart();
+  }
+
+  @Override
+  protected void serviceStop() throws Exception {
+    if (updateThread != null) {
+      updateThread.interrupt();
+      updateThread.join(THREAD_JOIN_TIMEOUT_MS);
+    }
+    schedulingMonitorManager.stop();
+    super.serviceStop();
   }
 
   @VisibleForTesting
   public ClusterNodeTracker getNodeTracker() {
     return nodeTracker;
+  }
+
+  @VisibleForTesting
+  public SchedulingMonitorManager getSchedulingMonitorManager() {
+    return schedulingMonitorManager;
   }
 
   /*
@@ -194,17 +255,18 @@ public abstract class AbstractYarnScheduler
     ApplicationId appId = currentAttempt.getApplicationId();
     SchedulerApplication<T> app = applications.get(appId);
     List<Container> containerList = new ArrayList<Container>();
-    RMApp appImpl = this.rmContext.getRMApps().get(appId);
-    if (appImpl.getApplicationSubmissionContext().getUnmanagedAM()) {
-      return containerList;
-    }
     if (app == null) {
       return containerList;
     }
-    Collection<RMContainer> liveContainers =
-        app.getCurrentAppAttempt().getLiveContainers();
-    ContainerId amContainerId = rmContext.getRMApps().get(appId)
-        .getCurrentAppAttempt().getMasterContainer().getId();
+    Collection<RMContainer> liveContainers = app.getCurrentAppAttempt()
+        .pullContainersToTransfer();
+    ContainerId amContainerId = null;
+    // For UAM, amContainer would be null
+    if (rmContext.getRMApps().get(appId).getCurrentAppAttempt()
+        .getMasterContainer() != null) {
+      amContainerId = rmContext.getRMApps().get(appId).getCurrentAppAttempt()
+          .getMasterContainer().getId();
+    }
     for (RMContainer rmContainer : liveContainers) {
       if (!rmContainer.getContainerId().equals(amContainerId)) {
         containerList.add(rmContainer.getContainer());
@@ -232,6 +294,14 @@ public abstract class AbstractYarnScheduler
       }
     };
     return nodeTracker.getNodes(nodeFilter);
+  }
+
+  public List<N> getNodes(final NodeFilter filter) {
+    return nodeTracker.getNodes(filter);
+  }
+
+  public boolean shouldContainersBeAutoUpdated() {
+    return this.autoUpdateContainers;
   }
 
   @Override
@@ -322,6 +392,7 @@ public abstract class AbstractYarnScheduler
 
   }
 
+  // TODO: Rename it to getCurrentApplicationAttempt
   public T getApplicationAttempt(ApplicationAttemptId applicationAttemptId) {
     SchedulerApplication<T> app = applications.get(
         applicationAttemptId.getApplicationId());
@@ -390,7 +461,7 @@ public abstract class AbstractYarnScheduler
   }
 
   @Override
-  public void addQueue(Queue newQueue) throws YarnException {
+  public void addQueue(Queue newQueue) throws YarnException, IOException {
     throw new YarnException(getClass().getSimpleName()
         + " does not support this operation");
   }
@@ -460,7 +531,8 @@ public abstract class AbstractYarnScheduler
         }
 
         // create container
-        RMContainer rmContainer = recoverAndCreateContainer(container, nm);
+        RMContainer rmContainer = recoverAndCreateContainer(container, nm,
+            schedulerApp.getQueue().getQueueName());
 
         // recover RMContainer
         rmContainer.handle(
@@ -510,20 +582,22 @@ public abstract class AbstractYarnScheduler
   }
 
   private RMContainer recoverAndCreateContainer(NMContainerStatus status,
-      RMNode node) {
+      RMNode node, String queueName) {
     Container container =
         Container.newInstance(status.getContainerId(), node.getNodeID(),
           node.getHttpAddress(), status.getAllocatedResource(),
           status.getPriority(), null);
     container.setVersion(status.getVersion());
+    container.setExecutionType(status.getExecutionType());
+    container.setAllocationRequestId(status.getAllocationRequestId());
+    container.setAllocationTags(status.getAllocationTags());
     ApplicationAttemptId attemptId =
         container.getId().getApplicationAttemptId();
-    RMContainer rmContainer =
-        new RMContainerImpl(container,
-            SchedulerRequestKey.extractFrom(container), attemptId,
-            node.getNodeID(), applications.get(
-            attemptId.getApplicationId()).getUser(), rmContext,
-            status.getCreationTime(), status.getNodeLabelExpression());
+    RMContainer rmContainer = new RMContainerImpl(container,
+        SchedulerRequestKey.extractFrom(container), attemptId, node.getNodeID(),
+        applications.get(attemptId.getApplicationId()).getUser(), rmContext,
+        status.getCreationTime(), status.getNodeLabelExpression());
+    ((RMContainerImpl) rmContainer).setQueueName(queueName);
     return rmContainer;
   }
 
@@ -534,10 +608,10 @@ public abstract class AbstractYarnScheduler
    * @param rmContainer rmContainer
    */
   private void recoverResourceRequestForContainer(RMContainer rmContainer) {
-    List<ResourceRequest> requests = rmContainer.getResourceRequests();
+    ContainerRequest containerRequest = rmContainer.getContainerRequest();
 
     // If container state is moved to ACQUIRED, request will be empty.
-    if (requests == null) {
+    if (containerRequest == null) {
       return;
     }
 
@@ -552,7 +626,7 @@ public abstract class AbstractYarnScheduler
     SchedulerApplicationAttempt schedulerAttempt =
         getCurrentAttemptForContainer(rmContainer.getContainerId());
     if (schedulerAttempt != null) {
-      schedulerAttempt.recoverResourceRequestsForContainer(requests);
+      schedulerAttempt.recoverResourceRequestsForContainer(containerRequest);
     }
   }
 
@@ -741,7 +815,7 @@ public abstract class AbstractYarnScheduler
       writeLock.unlock();
     }
   }
-  
+
   /**
    * Process resource update on a node.
    */
@@ -804,6 +878,16 @@ public abstract class AbstractYarnScheduler
   }
 
   @Override
+  public List<SchedulingRequest> getPendingSchedulingRequestsForAttempt(
+      ApplicationAttemptId attemptId) {
+    SchedulerApplicationAttempt attempt = getApplicationAttempt(attemptId);
+    if (attempt != null) {
+      return attempt.getAppSchedulingInfo().getAllSchedulingRequests();
+    }
+    return null;
+  }
+
+  @Override
   public Priority checkAndGetApplicationPriority(
       Priority priorityRequestedByApp, UserGroupInformation user,
       String queueName, ApplicationId applicationId) throws YarnException {
@@ -844,12 +928,12 @@ public abstract class AbstractYarnScheduler
     LOG.info("Updated the cluste max priority to maxClusterLevelAppPriority = "
         + maxClusterLevelAppPriority);
   }
-  
+
   /**
    * Sanity check increase/decrease request, and return
    * SchedulerContainerResourceChangeRequest according to given
    * UpdateContainerRequest.
-   * 
+   *
    * <pre>
    * - Returns non-null value means validation succeeded
    * - Throw exception when any other error happens
@@ -914,11 +998,11 @@ public abstract class AbstractYarnScheduler
   /**
    * Get lists of new containers from NodeManager and process them.
    * @param nm The RMNode corresponding to the NodeManager
+   * @param schedulerNode schedulerNode
    * @return list of completed containers
    */
-  protected List<ContainerStatus> updateNewContainerInfo(RMNode nm) {
-    SchedulerNode node = getNode(nm.getNodeID());
-
+  private List<ContainerStatus> updateNewContainerInfo(RMNode nm,
+      SchedulerNode schedulerNode) {
     List<UpdatedContainerInfo> containerInfoList = nm.pullContainerUpdates();
     List<ContainerStatus> newlyLaunchedContainers =
         new ArrayList<>();
@@ -933,14 +1017,15 @@ public abstract class AbstractYarnScheduler
 
     // Processing the newly launched containers
     for (ContainerStatus launchedContainer : newlyLaunchedContainers) {
-      containerLaunchedOnNode(launchedContainer.getContainerId(), node);
+      containerLaunchedOnNode(launchedContainer.getContainerId(),
+          schedulerNode);
     }
 
     // Processing the newly increased containers
     List<Container> newlyIncreasedContainers =
         nm.pullNewlyIncreasedContainers();
     for (Container container : newlyIncreasedContainers) {
-      containerIncreasedOnNode(container.getId(), node, container);
+      containerIncreasedOnNode(container.getId(), schedulerNode, container);
     }
 
     return completedContainers;
@@ -951,12 +1036,12 @@ public abstract class AbstractYarnScheduler
    * @param completedContainers Extracted list of completed containers
    * @param releasedResources Reference resource object for completed containers
    * @param nodeId NodeId corresponding to the NodeManager
+   * @param schedulerNode schedulerNode
    * @return The total number of released containers
    */
-  protected int updateCompletedContainers(List<ContainerStatus>
-      completedContainers, Resource releasedResources, NodeId nodeId) {
+  private int updateCompletedContainers(List<ContainerStatus> completedContainers,
+      Resource releasedResources, NodeId nodeId, SchedulerNode schedulerNode) {
     int releasedContainers = 0;
-    SchedulerNode node = getNode(nodeId);
     List<ContainerId> untrackedContainerIdList = new ArrayList<ContainerId>();
     for (ContainerStatus completedContainer : completedContainers) {
       ContainerId containerId = completedContainer.getContainerId();
@@ -964,8 +1049,8 @@ public abstract class AbstractYarnScheduler
       RMContainer container = getRMContainer(containerId);
       completedContainer(container,
           completedContainer, RMContainerEventType.FINISHED);
-      if (node != null) {
-        node.releaseContainer(containerId, true);
+      if (schedulerNode != null) {
+        schedulerNode.releaseContainer(containerId, true);
       }
 
       if (container != null) {
@@ -1010,14 +1095,14 @@ public abstract class AbstractYarnScheduler
   /**
    * Update container and utilization information on the NodeManager.
    * @param nm The NodeManager to update
+   * @param schedulerNode schedulerNode
    */
-  protected void updateNodeResourceUtilization(RMNode nm) {
-    SchedulerNode node = getNode(nm.getNodeID());
+  protected void updateNodeResourceUtilization(RMNode nm,
+      SchedulerNode schedulerNode) {
     // Updating node resource utilization
-    node.setAggregatedContainersUtilization(
+    schedulerNode.setAggregatedContainersUtilization(
         nm.getAggregatedContainersUtilization());
-    node.setNodeUtilization(nm.getNodeUtilization());
-
+    schedulerNode.setNodeUtilization(nm.getNodeUtilization());
   }
 
   /**
@@ -1031,45 +1116,55 @@ public abstract class AbstractYarnScheduler
     }
 
     // Process new container information
-    List<ContainerStatus> completedContainers = updateNewContainerInfo(nm);
+    // NOTICE: it is possible to not find the NodeID as a node can be
+    // decommissioned at the same time. Skip updates if node is null.
+    SchedulerNode schedulerNode = getNode(nm.getNodeID());
+    List<ContainerStatus> completedContainers = updateNewContainerInfo(nm,
+        schedulerNode);
+
+    // Notify Scheduler Node updated.
+    if (schedulerNode != null) {
+      schedulerNode.notifyNodeUpdate();
+    }
 
     // Process completed containers
     Resource releasedResources = Resource.newInstance(0, 0);
     int releasedContainers = updateCompletedContainers(completedContainers,
-        releasedResources, nm.getNodeID());
+        releasedResources, nm.getNodeID(), schedulerNode);
 
     // If the node is decommissioning, send an update to have the total
     // resource equal to the used resource, so no available resource to
     // schedule.
-    // TODO YARN-5128: Fix possible race-condition when request comes in before
-    // update is propagated
-    if (nm.getState() == NodeState.DECOMMISSIONING) {
+    if (nm.getState() == NodeState.DECOMMISSIONING && schedulerNode != null) {
       this.rmContext
           .getDispatcher()
           .getEventHandler()
           .handle(
               new RMNodeResourceUpdateEvent(nm.getNodeID(), ResourceOption
-                  .newInstance(getSchedulerNode(nm.getNodeID())
-                      .getAllocatedResource(), 0)));
+                  .newInstance(schedulerNode.getAllocatedResource(), 0)));
     }
 
     updateSchedulerHealthInformation(releasedResources, releasedContainers);
-    updateNodeResourceUtilization(nm);
+    if (schedulerNode != null) {
+      updateNodeResourceUtilization(nm, schedulerNode);
+    }
 
     // Now node data structures are up-to-date and ready for scheduling.
     if(LOG.isDebugEnabled()) {
-      SchedulerNode node = getNode(nm.getNodeID());
-      LOG.debug("Node being looked for scheduling " + nm +
-          " availableResource: " + node.getUnallocatedResource());
+      LOG.debug(
+          "Node being looked for scheduling " + nm + " availableResource: " +
+              (schedulerNode == null ? "unknown (decommissioned)" :
+                  schedulerNode.getUnallocatedResource()));
     }
   }
 
   @Override
-  public Resource getNormalizedResource(Resource requestedResource) {
+  public Resource getNormalizedResource(Resource requestedResource,
+                                        Resource maxResourceCapability) {
     return SchedulerUtils.getNormalizedResource(requestedResource,
         getResourceCalculator(),
         getMinimumResourceCapability(),
-        getMaximumResourceCapability(),
+        maxResourceCapability,
         getMinimumResourceCapability());
   }
 
@@ -1078,9 +1173,21 @@ public abstract class AbstractYarnScheduler
    *
    * @param asks resource requests
    */
-  protected void normalizeRequests(List<ResourceRequest> asks) {
-    for (ResourceRequest ask: asks) {
-      ask.setCapability(getNormalizedResource(ask.getCapability()));
+  protected void normalizeResourceRequests(List<ResourceRequest> asks) {
+    normalizeResourceRequests(asks, null);
+  }
+
+  /**
+   * Normalize a list of resource requests
+   * using queue maximum resource allocations.
+   * @param asks resource requests
+   */
+  protected void normalizeResourceRequests(List<ResourceRequest> asks,
+      String queueName) {
+    Resource maxAllocation = getMaximumResourceCapability(queueName);
+    for (ResourceRequest ask : asks) {
+      ask.setCapability(
+          getNormalizedResource(ask.getCapability(), maxAllocation));
     }
   }
 
@@ -1261,5 +1368,133 @@ public abstract class AbstractYarnScheduler
   @Override
   public List<NodeId> getNodeIds(String resourceName) {
     return nodeTracker.getNodeIdsByResourceName(resourceName);
+  }
+
+  /**
+   * To be used to release a container via a Scheduler Event rather than
+   * in the same thread.
+   * @param container Container.
+   */
+  public void asyncContainerRelease(RMContainer container) {
+    this.rmContext.getDispatcher().getEventHandler().handle(
+        new ReleaseContainerEvent(container));
+  }
+
+  /*
+   * Get a Resource object with for the minimum allocation possible.
+   *
+   * @return a Resource object with the minimum allocation for the scheduler
+   */
+  public Resource getMinimumAllocation() {
+    Resource ret = ResourceUtils.getResourceTypesMinimumAllocation();
+    LOG.info("Minimum allocation = " + ret);
+    return ret;
+  }
+
+  /**
+   * Get a Resource object with for the maximum allocation possible.
+   *
+   * @return a Resource object with the maximum allocation for the scheduler
+   */
+
+  public Resource getMaximumAllocation() {
+    Resource ret = ResourceUtils.getResourceTypesMaximumAllocation();
+    LOG.info("Maximum allocation = " + ret);
+    return ret;
+  }
+
+  @Override
+  public long checkAndGetApplicationLifetime(String queueName, long lifetime) {
+    // Lifetime is the application lifetime by default.
+    return lifetime;
+  }
+
+  @Override
+  public long getMaximumApplicationLifetime(String queueName) {
+    return -1;
+  }
+
+  /**
+   * Kill a RMContainer. This is meant to be called in tests only to simulate
+   * AM container failures.
+   * @param container the container to kill
+   */
+  @VisibleForTesting
+  public abstract void killContainer(RMContainer container);
+
+  /**
+   * Update internal state of the scheduler.  This can be useful for scheduler
+   * implementations that maintain some state that needs to be periodically
+   * updated; for example, metrics or queue resources.  It will be called by the
+   * {@link UpdateThread} every {@link #updateInterval}.  By default, it will
+   * not run; subclasses should set {@link #updateInterval} to a
+   * positive value during {@link #serviceInit(Configuration)} if they want to
+   * enable the thread.
+   */
+  @VisibleForTesting
+  public void update() {
+    // do nothing by default
+  }
+
+  /**
+   * Thread which calls {@link #update()} every
+   * <code>updateInterval</code> milliseconds.
+   */
+  private class UpdateThread extends Thread {
+    @Override
+    public void run() {
+      while (!Thread.currentThread().isInterrupted()) {
+        try {
+          synchronized (updateThreadMonitor) {
+            updateThreadMonitor.wait(updateInterval);
+          }
+          update();
+        } catch (InterruptedException ie) {
+          LOG.warn("Scheduler UpdateThread interrupted. Exiting.");
+          return;
+        } catch (Exception e) {
+          LOG.error("Exception in scheduler UpdateThread", e);
+        }
+      }
+    }
+  }
+
+  /**
+   * Allows {@link UpdateThread} to start processing without waiting till
+   * {@link #updateInterval}.
+   */
+  protected void triggerUpdate() {
+    synchronized (updateThreadMonitor) {
+      updateThreadMonitor.notify();
+    }
+  }
+
+  @Override
+  public void reinitialize(Configuration conf, RMContext rmContext)
+      throws IOException {
+    try {
+      LOG.info("Reinitializing SchedulingMonitorManager ...");
+      schedulingMonitorManager.reinitialize(rmContext, conf);
+    } catch (YarnException e) {
+      throw new IOException(e);
+    }
+  }
+
+  /**
+   * Default implementation. Always returns false.
+   * @param appAttempt ApplicationAttempt.
+   * @param schedulingRequest SchedulingRequest.
+   * @param schedulerNode SchedulerNode.
+   * @return Success or not.
+   */
+  @Override
+  public boolean attemptAllocationOnNode(SchedulerApplicationAttempt appAttempt,
+      SchedulingRequest schedulingRequest, SchedulerNode schedulerNode) {
+    return false;
+  }
+
+  @Override
+  public void resetSchedulerMetrics() {
+    // reset scheduler metrics
   }
 }

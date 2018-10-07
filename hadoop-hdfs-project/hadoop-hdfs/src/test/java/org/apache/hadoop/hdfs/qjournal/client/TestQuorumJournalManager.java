@@ -40,8 +40,8 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeoutException;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
 import org.apache.hadoop.hdfs.qjournal.MiniJournalCluster;
@@ -72,7 +72,7 @@ import com.google.common.collect.Lists;
  * For true unit tests, see {@link TestQuorumJournalManagerUnit}.
  */
 public class TestQuorumJournalManager {
-  private static final Log LOG = LogFactory.getLog(
+  private static final Logger LOG = LoggerFactory.getLogger(
       TestQuorumJournalManager.class);
   
   private MiniJournalCluster cluster;
@@ -93,13 +93,14 @@ public class TestQuorumJournalManager {
     conf.setInt(CommonConfigurationKeysPublic.IPC_CLIENT_CONNECT_MAX_RETRIES_KEY, 0);
     
     cluster = new MiniJournalCluster.Builder(conf)
-      .build();
+        .baseDir(GenericTestUtils.getRandomizedTestDir().getAbsolutePath())
+        .build();
     cluster.waitActive();
     
     qjm = createSpyingQJM();
     spies = qjm.getLoggerSetForTests().getLoggersForTests();
 
-    qjm.format(QJMTestUtil.FAKE_NSINFO);
+    qjm.format(QJMTestUtil.FAKE_NSINFO, false);
     qjm.recoverUnfinalizedSegments();
     assertEquals(1, qjm.getLoggerSetForTests().getEpoch());
   }
@@ -107,7 +108,7 @@ public class TestQuorumJournalManager {
   @After
   public void shutdown() throws IOException, InterruptedException,
       TimeoutException {
-    IOUtils.cleanup(LOG, toClose.toArray(new Closeable[0]));
+    IOUtils.cleanupWithLogger(LOG, toClose.toArray(new Closeable[0]));
 
     // Should not leak clients between tests -- this can cause flaky tests.
     // (See HDFS-4643)
@@ -148,7 +149,7 @@ public class TestQuorumJournalManager {
     QuorumJournalManager qjm = closeLater(new QuorumJournalManager(
         conf, cluster.getQuorumJournalURI("testFormat-jid"), FAKE_NSINFO));
     assertFalse(qjm.hasSomeData());
-    qjm.format(FAKE_NSINFO);
+    qjm.format(FAKE_NSINFO, false);
     assertTrue(qjm.hasSomeData());
   }
   
@@ -171,7 +172,7 @@ public class TestQuorumJournalManager {
       verifyEdits(streams, 1, 3);
       assertNull(stream.readOp());
     } finally {
-      IOUtils.cleanup(LOG, streams.toArray(new Closeable[0]));
+      IOUtils.cleanupWithLogger(LOG, streams.toArray(new Closeable[0]));
       streams.clear();
     }
     
@@ -186,7 +187,7 @@ public class TestQuorumJournalManager {
       assertEquals(3, stream.getLastTxId());
       verifyEdits(streams, 1, 3);
     } finally {
-      IOUtils.cleanup(LOG, streams.toArray(new Closeable[0]));
+      IOUtils.cleanupWithLogger(LOG, streams.toArray(new Closeable[0]));
       streams.clear();
     }
     
@@ -204,7 +205,7 @@ public class TestQuorumJournalManager {
 
       verifyEdits(streams, 1, 6);
     } finally {
-      IOUtils.cleanup(LOG, streams.toArray(new Closeable[0]));
+      IOUtils.cleanupWithLogger(LOG, streams.toArray(new Closeable[0]));
       streams.clear();
     }
   }
@@ -233,7 +234,7 @@ public class TestQuorumJournalManager {
       readerQjm.selectInputStreams(streams, 1, false);
       verifyEdits(streams, 1, 9);
     } finally {
-      IOUtils.cleanup(LOG, streams.toArray(new Closeable[0]));
+      IOUtils.cleanupWithLogger(LOG, streams.toArray(new Closeable[0]));
       readerQjm.close();
     }
   }
@@ -933,15 +934,40 @@ public class TestQuorumJournalManager {
     
     verifyEdits(streams, 25, 50);
   }
-  
+
+  @Test
+  public void testInProgressRecovery() throws Exception {
+    // Test the case when in-progress edit log tailing is on, and
+    // new active performs recovery when the old active crashes
+    // without closing the last log segment.
+    // See HDFS-13145 for more details.
+
+    // Write two batches of edits. After these, the commitId on the
+    // journals should be 5, and endTxnId should be 8.
+    EditLogOutputStream stm = qjm.startLogSegment(1,
+        NameNodeLayoutVersion.CURRENT_LAYOUT_VERSION);
+    writeTxns(stm, 1, 5);
+    writeTxns(stm, 6, 3);
+
+    // Do recovery from a separate QJM, just like in failover.
+    QuorumJournalManager qjm2 = createSpyingQJM();
+    qjm2.recoverUnfinalizedSegments();
+    checkRecovery(cluster, 1, 8);
+
+    // When selecting input stream, we should see all txns up to 8.
+    List<EditLogInputStream> streams = new ArrayList<>();
+    qjm2.selectInputStreams(streams, 1, true, true);
+    verifyEdits(streams, 1, 8);
+  }
   
   private QuorumJournalManager createSpyingQJM()
       throws IOException, URISyntaxException {
     AsyncLogger.Factory spyFactory = new AsyncLogger.Factory() {
       @Override
       public AsyncLogger createLogger(Configuration conf, NamespaceInfo nsInfo,
-          String journalId, InetSocketAddress addr) {
-        AsyncLogger logger = new IPCLoggerChannel(conf, nsInfo, journalId, addr) {
+          String journalId, String nameServiceId, InetSocketAddress addr) {
+        AsyncLogger logger = new IPCLoggerChannel(conf, nsInfo, journalId,
+            nameServiceId, addr) {
           protected ExecutorService createSingleThreadExecutor() {
             // Don't parallelize calls to the quorum in the tests.
             // This makes the tests more deterministic.

@@ -25,8 +25,8 @@ import java.util.Map;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.Path;
@@ -36,8 +36,8 @@ import org.apache.hadoop.hdfs.DFSUtilClient;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockInfo;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockStoragePolicySuite;
+import org.apache.hadoop.hdfs.server.blockmanagement.BlockUnderConstructionFeature;
 import org.apache.hadoop.hdfs.DFSUtil;
-import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
 import org.apache.hadoop.hdfs.server.namenode.INodeReference.DstReference;
 import org.apache.hadoop.hdfs.server.namenode.INodeReference.WithName;
 import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
@@ -56,7 +56,7 @@ import com.google.common.base.Preconditions;
  */
 @InterfaceAudience.Private
 public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
-  public static final Log LOG = LogFactory.getLog(INode.class);
+  public static final Logger LOG = LoggerFactory.getLogger(INode.class);
 
   /** parent is either an {@link INodeDirectory} or an {@link INodeReference}.*/
   private INode parent = null;
@@ -469,21 +469,10 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
 
   /**
    * Check and add namespace/storagespace/storagetype consumed to itself and the ancestors.
-   * @throws QuotaExceededException if quote is violated.
    */
-  public void addSpaceConsumed(QuotaCounts counts, boolean verify)
-    throws QuotaExceededException {
-    addSpaceConsumed2Parent(counts, verify);
-  }
-
-  /**
-   * Check and add namespace/storagespace/storagetype consumed to itself and the ancestors.
-   * @throws QuotaExceededException if quote is violated.
-   */
-  void addSpaceConsumed2Parent(QuotaCounts counts, boolean verify)
-    throws QuotaExceededException {
+  public void addSpaceConsumed(QuotaCounts counts) {
     if (parent != null) {
-      parent.addSpaceConsumed(counts, verify);
+      parent.addSpaceConsumed(counts);
     }
   }
 
@@ -724,8 +713,11 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
   /**
    * Set last access time of inode.
    */
-  public final INode setAccessTime(long accessTime, int latestSnapshotId) {
-    recordModification(latestSnapshotId);
+  public final INode setAccessTime(long accessTime, int latestSnapshotId,
+      boolean skipCaptureAccessTimeOnlyChangeInSnapshot) {
+    if (!skipCaptureAccessTimeOnlyChangeInSnapshot) {
+      recordModification(latestSnapshotId);
+    }
     setAccessTime(accessTime);
     return this;
   }
@@ -780,8 +772,17 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
     return StringUtils.split(path, Path.SEPARATOR_CHAR);
   }
 
+  /**
+   * Verifies if the path informed is a valid absolute path.
+   * @param path the absolute path to validate.
+   * @return true if the path is valid.
+   */
+  static boolean isValidAbsolutePath(final String path){
+    return path != null && path.startsWith(Path.SEPARATOR);
+  }
+
   private static void checkAbsolutePath(final String path) {
-    if (path == null || !path.startsWith(Path.SEPARATOR)) {
+    if (!isValidAbsolutePath(path)) {
       throw new AssertionError("Absolute path required, but got '"
           + path + "'");
     }
@@ -1046,6 +1047,17 @@ public abstract class INode implements INodeAttributes, Diff.Element<byte[]> {
       assert toDelete != null : "toDelete is null";
       toDelete.delete();
       toDeleteList.add(toDelete);
+      // If the file is being truncated
+      // the copy-on-truncate block should also be collected for deletion
+      BlockUnderConstructionFeature uc = toDelete.getUnderConstructionFeature();
+      if(uc == null) {
+        return;
+      }
+      BlockInfo truncateBlock = uc.getTruncateBlock();
+      if(truncateBlock == null || truncateBlock.equals(toDelete)) {
+        return;
+      }
+      addDeleteBlock(truncateBlock);
     }
 
     public void addUpdateReplicationFactor(BlockInfo block, short targetRepl) {

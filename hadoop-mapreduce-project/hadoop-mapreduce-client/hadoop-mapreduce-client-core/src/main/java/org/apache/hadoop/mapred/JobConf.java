@@ -24,8 +24,6 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import com.google.common.annotations.VisibleForTesting;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.classification.InterfaceStability;
@@ -53,6 +51,8 @@ import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.util.ClassUtil;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.Tool;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** 
  * A map/reduce job configuration.
@@ -115,7 +115,7 @@ import org.apache.hadoop.util.Tool;
 @InterfaceStability.Stable
 public class JobConf extends Configuration {
 
-  private static final Log LOG = LogFactory.getLog(JobConf.class);
+  private static final Logger LOG = LoggerFactory.getLogger(JobConf.class);
   private static final Pattern JAVA_OPTS_XMX_PATTERN =
           Pattern.compile(".*(?:^|\\s)-Xmx(\\d+)([gGmMkK]?)(?:$|\\s).*");
 
@@ -312,6 +312,15 @@ public class JobConf extends Configuration {
    * <ul>
    *   <li> A=foo - This will set the env variable A to foo. </li>
    * </ul>
+   *
+   * You can also add environment variables individually by appending
+   * <code>.VARNAME</code> to this configuration key, where VARNAME is
+   * the name of the environment variable.
+   *
+   * Example:
+   * <ul>
+   *   <li>mapreduce.map.env.VARNAME=value</li>
+   * </ul>
    */
   public static final String MAPRED_MAP_TASK_ENV = JobContext.MAP_ENV;
   
@@ -325,6 +334,15 @@ public class JobConf extends Configuration {
    * Example:
    * <ul>
    *   <li> A=foo - This will set the env variable A to foo. </li>
+   * </ul>
+   *
+   * You can also add environment variables individually by appending
+   * <code>.VARNAME</code> to this configuration key, where VARNAME is
+   * the name of the environment variable.
+   *
+   * Example:
+   * <ul>
+   *   <li>mapreduce.reduce.env.VARNAME=value</li>
    * </ul>
    */
   public static final String MAPRED_REDUCE_TASK_ENV = JobContext.REDUCE_ENV;

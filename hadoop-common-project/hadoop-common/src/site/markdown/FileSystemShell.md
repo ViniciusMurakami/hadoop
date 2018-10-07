@@ -400,6 +400,19 @@ Exit Code:
 
 Returns 0 on success and non-zero on error.
 
+head
+----
+
+Usage: `hadoop fs -head URI`
+
+Displays first kilobyte of the file to stdout.
+
+Example:
+
+* `hadoop fs -head pathname`
+
+Exit Code: Returns 0 on success and -1 on error.
+
 help
 ----
 
@@ -676,11 +689,11 @@ stat
 
 Usage: `hadoop fs -stat [format] <path> ...`
 
-Print statistics about the file/directory at \<path\> in the specified format. Format accepts permissions in octal (%a) and symbolic (%A), filesize in bytes (%b), type (%F), group name of owner (%g), name (%n), block size (%o), replication (%r), user name of owner(%u), and modification date (%y, %Y). %y shows UTC date as "yyyy-MM-dd HH:mm:ss" and %Y shows milliseconds since January 1, 1970 UTC. If the format is not specified, %y is used by default.
+Print statistics about the file/directory at \<path\> in the specified format. Format accepts permissions in octal (%a) and symbolic (%A), filesize in bytes (%b), type (%F), group name of owner (%g), name (%n), block size (%o), replication (%r), user name of owner(%u), access date(%x, %X), and modification date (%y, %Y). %x and %y show UTC date as "yyyy-MM-dd HH:mm:ss", and %X and %Y show milliseconds since January 1, 1970 UTC. If the format is not specified, %y is used by default.
 
 Example:
 
-* `hadoop fs -stat "%F %a %u:%g %b %y %n" /file`
+* `hadoop fs -stat "type:%F perm:%a %u:%g size:%b mtime:%y atime:%x name:%n" /file`
 
 Exit Code: Returns 0 on success and -1 on error.
 
@@ -727,6 +740,38 @@ text
 Usage: `hadoop fs -text <src> `
 
 Takes a source file and outputs the file in text format. The allowed formats are zip and TextRecordInputStream.
+
+touch
+------
+
+Usage: `hadoop fs -touch [-a] [-m] [-t TIMESTAMP] [-c] URI [URI ...]`
+
+Updates the access and modification times of the file specified by the URI to the current time.
+If the file does not exist, then a zero length file is created at URI with current time as the
+timestamp of that URI.
+
+* Use -a option to change only the access time
+* Use -m option to change only the modification time
+* Use -t option to specify timestamp (in format yyyyMMddHHmmss) instead of current time
+* Use -c option to not create file if it does not exist
+
+The timestamp format is as follows
+* yyyy Four digit year (e.g. 2018)
+* MM Two digit month of the year (e.g. 08 for month of August)
+* dd Two digit day of the month (e.g. 01 for first day of the month)
+* HH Two digit hour of the day using 24 hour notation (e.g. 23 stands for 11 pm, 11 stands for 11 am)
+* mm Two digit minutes of the hour
+* ss Two digit seconds of the minute
+e.g. 20180809230000 represents August 9th 2018, 11pm
+
+Example:
+
+* `hadoop fs -touch pathname`
+* `hadoop fs -touch -m -t 20180809230000 pathname`
+* `hadoop fs -touch -t 20180809230000 pathname`
+* `hadoop fs -touch -a pathname`
+
+Exit Code: Returns 0 on success and -1 on error.
 
 touchz
 ------

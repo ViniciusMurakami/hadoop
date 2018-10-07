@@ -41,10 +41,15 @@ import com.google.common.annotations.VisibleForTesting;
  * The class is responsible for choosing the desired number of targets
  * for placing block replicas.
  * The replica placement strategy is that if the writer is on a datanode,
- * the 1st replica is placed on the local machine, 
- * otherwise a random datanode. The 2nd replica is placed on a datanode
- * that is on a different rack. The 3rd replica is placed on a datanode
- * which is on a different node of the rack as the second replica.
+ * the 1st replica is placed on the local machine by default
+ * (By passing the {@link org.apache.hadoop.fs.CreateFlag#NO_LOCAL_WRITE} flag
+ * the client can request not to put a block replica on the local datanode.
+ * Subsequent replicas will still follow default block placement policy.).
+ * If the writer is not on a datanode, the 1st replica is placed on a random
+ * node.
+ * The 2nd replica is placed on a datanode that is on a different rack.
+ * The 3rd replica is placed on a datanode which is on a different node of the
+ * rack as the second replica.
  */
 @InterfaceAudience.Private
 public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
@@ -61,6 +66,28 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
           return new StringBuilder();
         }
       };
+
+  private static final ThreadLocal<HashMap<NodeNotChosenReason, Integer>>
+      CHOOSE_RANDOM_REASONS = ThreadLocal
+      .withInitial(() -> new HashMap<NodeNotChosenReason, Integer>());
+
+  private enum NodeNotChosenReason {
+    NOT_IN_SERVICE("the node is not in service"),
+    NODE_STALE("the node is stale"),
+    NODE_TOO_BUSY("the node is too busy"),
+    TOO_MANY_NODES_ON_RACK("the rack has too many chosen nodes"),
+    NOT_ENOUGH_STORAGE_SPACE("not enough storage space to place the block");
+
+    private final String text;
+
+    NodeNotChosenReason(final String logText) {
+      text = logText;
+    }
+
+    private String getText() {
+      return text;
+    }
+  }
 
   protected boolean considerLoad; 
   protected double considerLoadFactor;
@@ -253,7 +280,9 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
     if (avoidLocalNode) {
       results = new ArrayList<>(chosenStorage);
       Set<Node> excludedNodeCopy = new HashSet<>(excludedNodes);
-      excludedNodeCopy.add(writer);
+      if (writer != null) {
+        excludedNodeCopy.add(writer);
+      }
       localNode = chooseTarget(numOfReplicas, writer,
           excludedNodeCopy, blocksize, maxNodesPerRack, results,
           avoidStaleNodes, storagePolicy,
@@ -458,9 +487,13 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
                                  throws NotEnoughReplicasException {
     final int numOfResults = results.size();
     if (numOfResults == 0) {
-      writer = chooseLocalStorage(writer, excludedNodes, blocksize,
-          maxNodesPerRack, results, avoidStaleNodes, storageTypes, true)
-          .getDatanodeDescriptor();
+      DatanodeStorageInfo storageInfo = chooseLocalStorage(writer,
+          excludedNodes, blocksize, maxNodesPerRack, results, avoidStaleNodes,
+          storageTypes, true);
+
+      writer = (storageInfo != null) ? storageInfo.getDatanodeDescriptor()
+                                     : null;
+
       if (--numOfReplicas == 0) {
         return writer;
       }
@@ -614,7 +647,7 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
 
       if (LOG.isDebugEnabled()) {
         LOG.debug("Failed to choose from local rack (location = " + localRack
-            + "); the second replica is not found, retry choosing ramdomly", e);
+            + "); the second replica is not found, retry choosing randomly", e);
       }
       //the second replica is not found, randomly choose one from the network
       return chooseRandom(NodeBase.ROOT, excludedNodes, blocksize,
@@ -636,7 +669,7 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
     } catch(NotEnoughReplicasException e) {
       if (LOG.isDebugEnabled()) {
         LOG.debug("Failed to choose from the next rack (location = " + nextRack
-            + "), retry choosing ramdomly", e);
+            + "), retry choosing randomly", e);
       }
       //otherwise randomly choose one from the network
       return chooseRandom(NodeBase.ROOT, excludedNodes, blocksize,
@@ -711,6 +744,7 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
       builder.setLength(0);
       builder.append("[");
     }
+    CHOOSE_RANDOM_REASONS.get().clear();
     boolean badTarget = false;
     DatanodeStorageInfo firstChosen = null;
     while (numOfReplicas > 0) {
@@ -781,13 +815,23 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
     }
     if (numOfReplicas>0) {
       String detail = enableDebugLogging;
-      if (LOG.isDebugEnabled()) {
-        if (badTarget && builder != null) {
-          detail = builder.toString();
+      if (LOG.isDebugEnabled() && builder != null) {
+        detail = builder.toString();
+        if (badTarget) {
           builder.setLength(0);
         } else {
+          if (detail.length() > 1) {
+            // only log if there's more than "[", which is always appended at
+            // the beginning of this method.
+            LOG.debug(detail);
+          }
           detail = "";
         }
+      }
+      final HashMap<NodeNotChosenReason, Integer> reasonMap =
+          CHOOSE_RANDOM_REASONS.get();
+      if (!reasonMap.isEmpty()) {
+        LOG.info("Not enough replicas was chosen. Reason:{}", reasonMap);
       }
       throw new NotEnoughReplicasException(detail);
     }
@@ -834,19 +878,56 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
     if (storage != null) {
       results.add(storage);
     } else {
-      logNodeIsNotChosen(dnd, "no good storage to place the block ");
+      logNodeIsNotChosen(dnd, NodeNotChosenReason.NOT_ENOUGH_STORAGE_SPACE,
+          " for storage type " + storageType);
     }
     return storage;
   }
 
   private static void logNodeIsNotChosen(DatanodeDescriptor node,
-      String reason) {
+      NodeNotChosenReason reason) {
+    logNodeIsNotChosen(node, reason, null);
+  }
+
+  private static void logNodeIsNotChosen(DatanodeDescriptor node,
+      NodeNotChosenReason reason, String reasonDetails) {
+    assert reason != null;
     if (LOG.isDebugEnabled()) {
       // build the error message for later use.
       debugLoggingBuilder.get()
           .append("\n  Datanode ").append(node)
-          .append(" is not chosen since ").append(reason).append(".");
+          .append(" is not chosen since ").append(reason.getText());
+      if (reasonDetails != null) {
+        debugLoggingBuilder.get().append(" ").append(reasonDetails);
+      }
+      debugLoggingBuilder.get().append(".");
     }
+    // always populate reason map to log high level reasons.
+    final HashMap<NodeNotChosenReason, Integer> reasonMap =
+        CHOOSE_RANDOM_REASONS.get();
+    Integer base = reasonMap.get(reason);
+    if (base == null) {
+      base = 0;
+    }
+    reasonMap.put(reason, base + 1);
+  }
+
+  /**
+   * Determine if a datanode should be chosen based on current workload.
+   *
+   * @param node The target datanode
+   * @return Return true if the datanode should be excluded, otherwise false
+   */
+  boolean excludeNodeByLoad(DatanodeDescriptor node){
+    final double maxLoad = considerLoadFactor *
+        stats.getInServiceXceiverAverage();
+    final int nodeLoad = node.getXceiverCount();
+    if ((nodeLoad > maxLoad) && (maxLoad > 0)) {
+      logNodeIsNotChosen(node, NodeNotChosenReason.NODE_TOO_BUSY,
+          "(load: " + nodeLoad + " > " + maxLoad + ")");
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -860,7 +941,7 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
    * @param results A list containing currently chosen nodes. Used to check if
    *                too many nodes has been chosen in the target rack.
    * @param avoidStaleNodes Whether or not to avoid choosing stale nodes
-   * @return Reture true if the datanode is good candidate, otherwise false
+   * @return Return true if the datanode is good candidate, otherwise false
    */
   boolean isGoodDatanode(DatanodeDescriptor node,
                          int maxTargetPerRack, boolean considerLoad,
@@ -868,25 +949,20 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
                          boolean avoidStaleNodes) {
     // check if the node is (being) decommissioned
     if (!node.isInService()) {
-      logNodeIsNotChosen(node, "the node isn't in service.");
+      logNodeIsNotChosen(node, NodeNotChosenReason.NOT_IN_SERVICE);
       return false;
     }
 
     if (avoidStaleNodes) {
       if (node.isStale(this.staleInterval)) {
-        logNodeIsNotChosen(node, "the node is stale ");
+        logNodeIsNotChosen(node, NodeNotChosenReason.NODE_STALE);
         return false;
       }
     }
 
     // check the communication traffic of the target machine
-    if (considerLoad) {
-      final double maxLoad = considerLoadFactor *
-          stats.getInServiceXceiverAverage();
-      final int nodeLoad = node.getXceiverCount();
-      if (nodeLoad > maxLoad) {
-        logNodeIsNotChosen(node, "the node is too busy (load: " + nodeLoad
-            + " > " + maxLoad + ") ");
+    if(considerLoad){
+      if(excludeNodeByLoad(node)){
         return false;
       }
     }
@@ -901,7 +977,7 @@ public class BlockPlacementPolicyDefault extends BlockPlacementPolicy {
       }
     }
     if (counter > maxTargetPerRack) {
-      logNodeIsNotChosen(node, "the rack has too many chosen nodes ");
+      logNodeIsNotChosen(node, NodeNotChosenReason.TOO_MANY_NODES_ON_RACK);
       return false;
     }
 

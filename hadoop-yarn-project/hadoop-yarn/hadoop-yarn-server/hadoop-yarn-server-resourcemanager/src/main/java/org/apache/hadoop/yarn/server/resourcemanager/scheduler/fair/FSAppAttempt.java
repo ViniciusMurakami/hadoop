@@ -43,18 +43,19 @@ import org.apache.hadoop.yarn.api.records.ResourceRequest;
 import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger;
 import org.apache.hadoop.yarn.server.resourcemanager.RMAuditLogger.AuditConstants;
 import org.apache.hadoop.yarn.server.resourcemanager.RMContext;
-import org.apache.hadoop.yarn.server.resourcemanager.resource.ResourceWeights;
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerEventType;
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerFinishedEvent;
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerImpl;
+import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainerState;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.ActiveUsersManager;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.NodeType;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerNode;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerUtils;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.ContainerRequest;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.common.PendingAsk;
 import org.apache.hadoop.yarn.server.scheduler.SchedulerRequestKey;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
@@ -75,15 +76,15 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
 
   private final long startTime;
   private final Priority appPriority;
-  private final ResourceWeights resourceWeights;
   private Resource demand = Resources.createResource(0);
   private final FairScheduler scheduler;
   private Resource fairShare = Resources.createResource(0, 0);
 
   // Preemption related variables
   private final Object preemptionVariablesLock = new Object();
-  private final Resource preemptedResources = Resources.clone(Resources.none());
-  private final Set<RMContainer> containersToPreempt = new HashSet<>();
+  private final Set<RMContainer> containersToBePreempted = new HashSet<>();
+  private final Resource resourcesToBePreempted =
+      Resources.clone(Resources.none());
 
   private Resource fairshareStarvation = Resources.none();
   private long lastTimeAtFairShare;
@@ -119,11 +120,6 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
     this.startTime = scheduler.getClock().getTime();
     this.lastTimeAtFairShare = this.startTime;
     this.appPriority = Priority.newInstance(1);
-    this.resourceWeights = new ResourceWeights();
-  }
-
-  ResourceWeights getResourceWeights() {
-    return resourceWeights;
   }
 
   /**
@@ -173,6 +169,7 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
           rmContainer.getNodeLabelExpression(),
           getUser(), 1, containerResource);
       this.attemptResourceUsage.decUsed(containerResource);
+      getQueue().decUsedResource(containerResource);
 
       // Clear resource utilization metrics cache.
       lastMemoryAggregateAllocationUpdateTime = -1;
@@ -462,14 +459,14 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
       // Add it to allContainers list.
       addToNewlyAllocatedContainers(node, rmContainer);
       liveContainers.put(container.getId(), rmContainer);
-
       // Update consumption and track allocations
-      List<ResourceRequest> resourceRequestList = appSchedulingInfo.allocate(
+      ContainerRequest containerRequest = appSchedulingInfo.allocate(
           type, node, schedulerKey, container);
       this.attemptResourceUsage.incUsed(container.getResource());
+      getQueue().incUsedResource(container.getResource());
 
       // Update resource requests related to "request" and store in RMContainer
-      ((RMContainerImpl) rmContainer).setResourceRequests(resourceRequestList);
+      ((RMContainerImpl) rmContainer).setContainerRequest(containerRequest);
 
       // Inform the container
       rmContainer.handle(
@@ -554,18 +551,28 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
     this.minshareStarvation = Resources.none();
   }
 
+  /**
+   * Get last computed minshare starvation.
+   *
+   * @return last computed minshare starvation
+   */
+  Resource getMinshareStarvation() {
+    return minshareStarvation;
+  }
+
   void trackContainerForPreemption(RMContainer container) {
     synchronized (preemptionVariablesLock) {
-      if (containersToPreempt.add(container)) {
-        Resources.addTo(preemptedResources, container.getAllocatedResource());
+      if (containersToBePreempted.add(container)) {
+        Resources.addTo(resourcesToBePreempted,
+            container.getAllocatedResource());
       }
     }
   }
 
   private void untrackContainerForPreemption(RMContainer container) {
     synchronized (preemptionVariablesLock) {
-      if (containersToPreempt.remove(container)) {
-        Resources.subtractFrom(preemptedResources,
+      if (containersToBePreempted.remove(container)) {
+        Resources.subtractFrom(resourcesToBePreempted,
             container.getAllocatedResource());
       }
     }
@@ -574,14 +581,15 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
   Set<ContainerId> getPreemptionContainerIds() {
     synchronized (preemptionVariablesLock) {
       Set<ContainerId> preemptionContainerIds = new HashSet<>();
-      for (RMContainer container : containersToPreempt) {
+      for (RMContainer container : containersToBePreempted) {
         preemptionContainerIds.add(container.getContainerId());
       }
       return preemptionContainerIds;
     }
   }
 
-  boolean canContainerBePreempted(RMContainer container) {
+  boolean canContainerBePreempted(RMContainer container,
+                                  Resource alreadyConsideringForPreemption) {
     if (!isPreemptable()) {
       return false;
     }
@@ -595,7 +603,7 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
     }
 
     synchronized (preemptionVariablesLock) {
-      if (containersToPreempt.contains(container)) {
+      if (containersToBePreempted.contains(container)) {
         // The container is already under consideration for preemption
         return false;
       }
@@ -603,10 +611,29 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
 
     // Check if the app's allocation will be over its fairshare even
     // after preempting this container
-    Resource usageAfterPreemption = Resources.subtract(
-        getResourceUsage(), container.getAllocatedResource());
+    Resource usageAfterPreemption = getUsageAfterPreemptingContainer(
+            container.getAllocatedResource(),
+            alreadyConsideringForPreemption);
 
     return !isUsageBelowShare(usageAfterPreemption, getFairShare());
+  }
+
+  private Resource getUsageAfterPreemptingContainer(Resource containerResources,
+          Resource alreadyConsideringForPreemption) {
+    Resource usageAfterPreemption = Resources.clone(getResourceUsage());
+
+    // Subtract resources of containers already queued for preemption
+    synchronized (preemptionVariablesLock) {
+      Resources.subtractFrom(usageAfterPreemption, resourcesToBePreempted);
+    }
+
+    // Subtract resources of this container and other containers of this app
+    // that the FSPreemptionThread is already considering for preemption.
+    Resources.subtractFrom(usageAfterPreemption, containerResources);
+    Resources.subtractFrom(usageAfterPreemption,
+            alreadyConsideringForPreemption);
+
+    return usageAfterPreemption;
   }
 
   /**
@@ -631,6 +658,32 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
         node.getRMNode().getHttpAddress(), capability,
         schedulerKey.getPriority(), null,
         schedulerKey.getAllocationRequestId());
+  }
+
+  @Override
+  public synchronized void recoverContainer(SchedulerNode node,
+      RMContainer rmContainer) {
+    try {
+      writeLock.lock();
+
+      super.recoverContainer(node, rmContainer);
+
+      if (!rmContainer.getState().equals(RMContainerState.COMPLETED)) {
+        getQueue().incUsedResource(rmContainer.getContainer().getResource());
+      }
+
+      // If not running unmanaged, the first container we recover is always
+      // the AM. Set the amResource for this app and update the leaf queue's AM
+      // usage
+      if (!isAmRunning() && !getUnmanagedAM()) {
+        Resource resource = rmContainer.getAllocatedResource();
+        setAMResource(resource);
+        getQueue().addAMResourceUsage(resource);
+        setAmRunning(true);
+      }
+    } finally {
+      writeLock.unlock();
+    }
   }
 
   /**
@@ -813,6 +866,12 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
         if (reserved) {
           unreserve(schedulerKey, node);
         }
+        if (LOG.isDebugEnabled()) {
+          LOG.debug(String.format(
+              "Resource ask %s fits in available node resources %s, " +
+                      "but no container was allocated",
+              capability, available));
+        }
         return Resources.none();
       }
 
@@ -842,7 +901,10 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
     }
 
     // The desired container won't fit here, so reserve
+    // Reserve only, if app does not wait for preempted resources on the node,
+    // otherwise we may end up with duplicate reservations
     if (isReservable(capability) &&
+        !node.isPreemptedForApp(this) &&
         reserve(pendingAsk.getPerAllocationResource(), node, reservedContainer,
             type, schedulerKey)) {
       updateAMDiagnosticMsg(capability, " exceeds the available resources of "
@@ -886,6 +948,7 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
     return false;
   }
 
+  @SuppressWarnings("deprecation")
   private Resource assignContainer(FSSchedulerNode node, boolean reserved) {
     if (LOG.isTraceEnabled()) {
       LOG.trace("Node offered to app: " + getName() + " reserved: " + reserved);
@@ -976,7 +1039,7 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
         }
 
         if (offswitchAsk.getCount() > 0) {
-          if (getSchedulingPlacementSet(schedulerKey).getUniqueLocationAsks()
+          if (getAppPlacementAllocator(schedulerKey).getUniqueLocationAsks()
               <= 1 || allowedLocality.equals(NodeType.OFF_SWITCH)) {
             if (LOG.isTraceEnabled()) {
               LOG.trace("Assign container on " + node.getNodeName()
@@ -1031,14 +1094,14 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
             (!hasRequestForRack || appSchedulingInfo.canDelayTo(key,
                 node.getRackName()) || (hasRequestForNode)) &&
             // The requested container must be able to fit on the node:
-            Resources.lessThanOrEqual(RESOURCE_CALCULATOR, null,
-                resource,
+            Resources.fitsIn(resource,
                 node.getRMNode().getTotalCapability()))) {
       ret = false;
     } else if (!getQueue().fitsInMaxShare(resource)) {
       // The requested container must fit in queue maximum share
       updateAMDiagnosticMsg(resource,
-          " exceeds current queue or its parents maximum resource allowed).");
+          " exceeds current queue or its parents maximum resource allowed). " +
+                  "Max share of queue: " + getQueue().getMaxShare());
 
       ret = false;
     }
@@ -1110,7 +1173,8 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
     }
 
     if (!starved ||
-        now - lastTimeAtFairShare < getQueue().getFairSharePreemptionTimeout()) {
+        now - lastTimeAtFairShare <
+            getQueue().getFairSharePreemptionTimeout()) {
       fairshareStarvation = Resources.none();
     } else {
       // The app has been starved for longer than preemption-timeout.
@@ -1138,7 +1202,7 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
   }
 
   /**
-   * Is application starved for fairshare or minshare
+   * Is application starved for fairshare or minshare.
    */
   boolean isStarved() {
     return isStarvedForFairShare() || !Resources.isNone(minshareStarvation);
@@ -1255,18 +1319,19 @@ public class FSAppAttempt extends SchedulerApplicationAttempt
 
   @Override
   public Resource getResourceUsage() {
-    // Subtract copies the object, so that we have a snapshot,
-    // in case usage changes, while the caller is using the value
-    synchronized (preemptionVariablesLock) {
-      return containersToPreempt.isEmpty()
-          ? getCurrentConsumption()
-          : Resources.subtract(getCurrentConsumption(), preemptedResources);
-    }
+    return getCurrentConsumption();
   }
 
   @Override
-  public ResourceWeights getWeights() {
-    return scheduler.getAppWeight(this);
+  public float getWeight() {
+    float weight = 1.0F;
+
+    if (scheduler.isSizeBasedWeight()) {
+      // Set weight based on current memory demand
+      weight = (float)(Math.log1p(demand.getMemorySize()) / Math.log(2));
+    }
+
+    return weight * appPriority.getPriority();
   }
 
   @Override

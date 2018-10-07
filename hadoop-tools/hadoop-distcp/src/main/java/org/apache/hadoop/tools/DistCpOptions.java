@@ -20,10 +20,12 @@ package org.apache.hadoop.tools;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.tools.util.DistCpUtils;
@@ -43,6 +45,8 @@ import java.util.Set;
  *
  * This class is immutable.
  */
+@InterfaceAudience.Public
+@InterfaceStability.Evolving
 public final class DistCpOptions {
   private static final Logger LOG = LoggerFactory.getLogger(Builder.class);
   public static final int MAX_NUM_LISTSTATUS_THREADS = 40;
@@ -67,6 +71,9 @@ public final class DistCpOptions {
 
   /** Whether source and target folder contents be sync'ed up. */
   private final boolean syncFolder;
+
+  /** Path to save source/dest sequence files to, if non-null. */
+  private final Path trackPath;
 
   /** Whether files only present in target should be deleted. */
   private boolean deleteMissing;
@@ -100,6 +107,9 @@ public final class DistCpOptions {
   // It's required that s2 is newer than s1, and src and tgt have exact same
   // content at their s1, if src is not the same as tgt.
   private final boolean useRdiff;
+
+  /** Whether to log additional info (path, size) in the SKIP/COPY log. */
+  private final boolean verboseLog;
 
   // For both -diff and -rdiff, given the example command line switches, two
   // steps are taken:
@@ -204,6 +214,8 @@ public final class DistCpOptions {
     this.blocksPerChunk = builder.blocksPerChunk;
 
     this.copyBufferSize = builder.copyBufferSize;
+    this.verboseLog = builder.verboseLog;
+    this.trackPath = builder.trackPath;
   }
 
   public Path getSourceFileListing() {
@@ -323,6 +335,14 @@ public final class DistCpOptions {
     return copyBufferSize;
   }
 
+  public boolean shouldVerboseLog() {
+    return verboseLog;
+  }
+
+  public Path getTrackPath() {
+    return trackPath;
+  }
+
   /**
    * Add options to configuration. These will be used in the Mapper/committer
    *
@@ -361,6 +381,16 @@ public final class DistCpOptions {
         String.valueOf(blocksPerChunk));
     DistCpOptionSwitch.addToConf(conf, DistCpOptionSwitch.COPY_BUFFER_SIZE,
         String.valueOf(copyBufferSize));
+    DistCpOptionSwitch.addToConf(conf, DistCpOptionSwitch.VERBOSE_LOG,
+        String.valueOf(verboseLog));
+    if (trackPath != null) {
+      DistCpOptionSwitch.addToConf(conf, DistCpOptionSwitch.TRACK_MISSING,
+          String.valueOf(trackPath));
+    }
+    if (numListstatusThreads > 0) {
+      DistCpOptionSwitch.addToConf(conf, DistCpOptionSwitch.NUM_LISTSTATUS_THREADS,
+          Integer.toString(numListstatusThreads));
+    }
   }
 
   /**
@@ -396,6 +426,7 @@ public final class DistCpOptions {
         ", filtersFile='" + filtersFile + '\'' +
         ", blocksPerChunk=" + blocksPerChunk +
         ", copyBufferSize=" + copyBufferSize +
+        ", verboseLog=" + verboseLog +
         '}';
   }
 
@@ -420,6 +451,7 @@ public final class DistCpOptions {
     private boolean append = false;
     private boolean skipCRC = false;
     private boolean blocking = true;
+    private boolean verboseLog = false;
 
     private boolean useDiff = false;
     private boolean useRdiff = false;
@@ -429,6 +461,7 @@ public final class DistCpOptions {
     private String filtersFile;
 
     private Path logPath;
+    private Path trackPath;
     private String copyStrategy = DistCpConstants.UNIFORMSIZE;
 
     private int numListstatusThreads = 0;  // 0 indicates that flag is not set.
@@ -522,11 +555,6 @@ public final class DistCpOptions {
             + "mutually exclusive");
       }
 
-      if (!syncFolder && skipCRC) {
-        throw new IllegalArgumentException(
-            "Skip CRC is valid only with update options");
-      }
-
       if (!syncFolder && append) {
         throw new IllegalArgumentException(
             "Append is valid only with update options");
@@ -551,6 +579,11 @@ public final class DistCpOptions {
       if (useDiff && useRdiff) {
         throw new IllegalArgumentException(
             "-diff and -rdiff are mutually exclusive");
+      }
+
+      if (verboseLog && logPath == null) {
+        throw new IllegalArgumentException(
+            "-v is valid only with -log option");
       }
     }
 
@@ -629,6 +662,11 @@ public final class DistCpOptions {
       return this;
     }
 
+    public Builder withTrackMissing(Path path) {
+      this.trackPath = path;
+      return this;
+    }
+
     public Builder withCopyStrategy(String newCopyStrategy) {
       this.copyStrategy = newCopyStrategy;
       return this;
@@ -683,6 +721,11 @@ public final class DistCpOptions {
       this.copyBufferSize =
           newCopyBufferSize > 0 ? newCopyBufferSize
               : DistCpConstants.COPY_BUFFER_SIZE_DEFAULT;
+      return this;
+    }
+
+    public Builder withVerboseLog(boolean newVerboseLog) {
+      this.verboseLog = newVerboseLog;
       return this;
     }
   }

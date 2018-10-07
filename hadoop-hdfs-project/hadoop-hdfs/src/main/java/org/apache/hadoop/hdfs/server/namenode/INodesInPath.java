@@ -18,12 +18,9 @@
 package org.apache.hadoop.hdfs.server.namenode;
 
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.NoSuchElementException;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.server.common.HdfsServerConstants;
@@ -39,7 +36,7 @@ import static org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot.ID_INTEGE
  * Contains INodes information resolved from a given path.
  */
 public class INodesInPath {
-  public static final Log LOG = LogFactory.getLog(INodesInPath.class);
+  public static final Logger LOG = LoggerFactory.getLogger(INodesInPath.class);
 
   /**
    * @return true if path component is {@link HdfsConstants#DOT_SNAPSHOT_DIR}
@@ -336,17 +333,9 @@ public class INodesInPath {
    *         otherwise, i < 0, return the (length + i)-th inode.
    */
   public INode getINode(int i) {
-    if (inodes == null || inodes.length == 0) {
-      throw new NoSuchElementException("inodes is null or empty");
-    }
-    int index = i >= 0 ? i : inodes.length + i;
-    if (index < inodes.length && index >= 0) {
-      return inodes[index];
-    } else {
-      throw new NoSuchElementException("inodes.length == " + inodes.length);
-    }
+    return inodes[(i < 0) ? inodes.length + i : i];
   }
-  
+
   /** @return the last inode. */
   public INode getLastINode() {
     return getINode(-1);
@@ -382,10 +371,6 @@ public class INodesInPath {
 
   public int length() {
     return inodes.length;
-  }
-
-  public List<INode> getReadOnlyINodes() {
-    return Collections.unmodifiableList(Arrays.asList(inodes));
   }
 
   public INode[] getINodesArray() {
@@ -499,7 +484,7 @@ public class INodesInPath {
     }
 
     final StringBuilder b = new StringBuilder(getClass().getSimpleName())
-        .append(": path = ").append(DFSUtil.byteArray2PathString(path))
+        .append(": path = ").append(getPath())
         .append("\n  inodes = ");
     if (inodes == null) {
       b.append("null");
