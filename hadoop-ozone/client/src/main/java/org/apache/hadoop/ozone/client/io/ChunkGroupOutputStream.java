@@ -21,7 +21,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import org.apache.hadoop.fs.FSExceptionMessages;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result;
-import org.apache.hadoop.hdds.scm.container.common.helpers.ContainerInfo;
+import org.apache.hadoop.hdds.scm.container.ContainerInfo;
 import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.hdds.scm.container.common.helpers.ContainerWithPipeline;
 import org.apache.hadoop.io.retry.RetryPolicy;
@@ -116,14 +116,19 @@ public class ChunkGroupOutputStream extends OutputStream {
   public List<ChunkOutputStreamEntry> getStreamEntries() {
     return streamEntries;
   }
+  @VisibleForTesting
+  public XceiverClientManager getXceiverClientManager() {
+    return xceiverClientManager;
+  }
 
-  public List<OmKeyLocationInfo> getLocationInfoList() {
+  public List<OmKeyLocationInfo> getLocationInfoList() throws IOException {
     List<OmKeyLocationInfo> locationInfoList = new ArrayList<>();
     for (ChunkOutputStreamEntry streamEntry : streamEntries) {
       OmKeyLocationInfo info =
           new OmKeyLocationInfo.Builder().setBlockID(streamEntry.blockID)
               .setShouldCreateContainer(false)
-              .setLength(streamEntry.currentPosition).setOffset(0).build();
+              .setLength(streamEntry.currentPosition).setOffset(0)
+              .build();
       locationInfoList.add(info);
     }
     return locationInfoList;
@@ -153,8 +158,6 @@ public class ChunkGroupOutputStream extends OutputStream {
     this.chunkSize = chunkSize;
     this.requestID = requestId;
     this.retryPolicy = retryPolicy;
-    LOG.debug("Expecting open key with one block, but got" +
-        info.getKeyLocationVersions().size());
   }
 
   /**
@@ -189,8 +192,7 @@ public class ChunkGroupOutputStream extends OutputStream {
     ContainerInfo container = containerWithPipeline.getContainerInfo();
 
     XceiverClientSpi xceiverClient =
-        xceiverClientManager.acquireClient(containerWithPipeline.getPipeline(),
-            container.getContainerID());
+        xceiverClientManager.acquireClient(containerWithPipeline.getPipeline());
     // create container if needed
     if (subKeyInfo.getShouldCreateContainer()) {
       try {
@@ -411,6 +413,11 @@ public class ChunkGroupOutputStream extends OutputStream {
       return;
     }
 
+    // update currentStreamIndex in case of closed container exception. The
+    // current stream entry cannot be used for further writes because
+    // container is closed.
+    currentStreamIndex += 1;
+
     // In case where not a single chunk of data has been written to the Datanode
     // yet. This block does not yet exist on the datanode but cached on the
     // outputStream buffer. No need to call GetCommittedBlockLength here
@@ -427,7 +434,6 @@ public class ChunkGroupOutputStream extends OutputStream {
       // allocate new block and write this data in the datanode. The cached
       // data in the buffer does not exceed chunkSize.
       Preconditions.checkState(buffer.position() < chunkSize);
-      currentStreamIndex += 1;
       // readjust the byteOffset value to the length actually been written.
       byteOffset -= buffer.position();
       handleWrite(buffer.array(), 0, buffer.position());
@@ -611,7 +617,7 @@ public class ChunkGroupOutputStream extends OutputStream {
 
   private static class ChunkOutputStreamEntry extends OutputStream {
     private OutputStream outputStream;
-    private final BlockID blockID;
+    private BlockID blockID;
     private final String key;
     private final XceiverClientManager xceiverClientManager;
     private final XceiverClientSpi xceiverClient;
@@ -697,6 +703,11 @@ public class ChunkGroupOutputStream extends OutputStream {
     public void close() throws IOException {
       if (this.outputStream != null) {
         this.outputStream.close();
+        // after closing the chunkOutPutStream, blockId would have been
+        // reconstructed with updated bcsId
+        if (this.outputStream instanceof ChunkOutputStream) {
+          this.blockID = ((ChunkOutputStream) outputStream).getBlockID();
+        }
       }
     }
 

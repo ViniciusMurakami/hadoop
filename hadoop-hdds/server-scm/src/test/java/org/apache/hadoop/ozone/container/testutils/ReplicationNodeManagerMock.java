@@ -20,8 +20,8 @@ import com.google.common.base.Preconditions;
 import org.apache.hadoop.hdds.protocol.proto
         .StorageContainerDatanodeProtocolProtos.PipelineReportsProto;
 import org.apache.hadoop.hdds.scm.container.ContainerID;
-import org.apache.hadoop.hdds.scm.container.common.helpers.Pipeline;
-import org.apache.hadoop.hdds.scm.container.common.helpers.PipelineID;
+import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
+import org.apache.hadoop.hdds.scm.pipeline.PipelineID;
 import org.apache.hadoop.hdds.scm.container.placement.metrics.SCMNodeMetric;
 import org.apache.hadoop.hdds.scm.container.placement.metrics.SCMNodeStat;
 import org.apache.hadoop.hdds.scm.exceptions.SCMException;
@@ -295,6 +295,12 @@ public class ReplicationNodeManagerMock implements NodeManager {
     return null;
   }
 
+  @Override
+  public Boolean isNodeRegistered(
+      DatanodeDetails datanodeDetails) {
+    return null;
+  }
+
   /**
    * Clears all nodes from the node Manager.
    */
@@ -340,5 +346,10 @@ public class ReplicationNodeManagerMock implements NodeManager {
   @Override
   public void processDeadNode(UUID dnUuid) {
     // do nothing.
+  }
+
+  @Override
+  public List<SCMCommand> getCommandQueue(UUID dnID) {
+    return null;
   }
 }

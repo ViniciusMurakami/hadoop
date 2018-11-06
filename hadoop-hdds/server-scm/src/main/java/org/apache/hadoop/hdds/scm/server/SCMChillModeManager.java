@@ -29,8 +29,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdds.HddsConfigKeys;
+import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.ScmOps;
-import org.apache.hadoop.hdds.scm.container.common.helpers.ContainerInfo;
+import org.apache.hadoop.hdds.scm.container.ContainerInfo;
 import org.apache.hadoop.hdds.scm.events.SCMEvents;
 import org.apache.hadoop.hdds.scm.server.SCMDatanodeProtocolServer
     .NodeRegistrationContainerReport;
@@ -57,6 +58,7 @@ public class SCMChillModeManager implements
 
   private static final Logger LOG =
       LoggerFactory.getLogger(SCMChillModeManager.class);
+  private final boolean isChillModeEnabled;
   private AtomicBoolean inChillMode = new AtomicBoolean(true);
   private AtomicLong containerWithMinReplicas = new AtomicLong(0);
   private Map<String, ChillModeExitRule> exitRules = new HashMap(1);
@@ -69,14 +71,17 @@ public class SCMChillModeManager implements
       EventQueue eventQueue) {
     this.config = conf;
     this.eventPublisher = eventQueue;
-    exitRules.put(CONT_EXIT_RULE,
-        new ContainerChillModeRule(config, allContainers));
-    exitRules.put(DN_EXIT_RULE, new DataNodeChillModeRule(config));
-    if (!conf.getBoolean(HddsConfigKeys.HDDS_SCM_CHILLMODE_ENABLED,
-        HddsConfigKeys.HDDS_SCM_CHILLMODE_ENABLED_DEFAULT)) {
+    this.isChillModeEnabled = conf.getBoolean(
+        HddsConfigKeys.HDDS_SCM_CHILLMODE_ENABLED,
+        HddsConfigKeys.HDDS_SCM_CHILLMODE_ENABLED_DEFAULT);
+    if (isChillModeEnabled) {
+      exitRules.put(CONT_EXIT_RULE,
+          new ContainerChillModeRule(config, allContainers));
+      exitRules.put(DN_EXIT_RULE, new DataNodeChillModeRule(config));
+      emitChillModeStatus();
+    } else {
       exitChillMode(eventQueue);
     }
-    emitChillModeStatus();
   }
 
   /**
@@ -84,7 +89,7 @@ public class SCMChillModeManager implements
    */
   @VisibleForTesting
   public void emitChillModeStatus() {
-    eventPublisher.fireEvent(SCMEvents.CHILL_MODE_STATUS, inChillMode.get());
+    eventPublisher.fireEvent(SCMEvents.CHILL_MODE_STATUS, getInChillMode());
   }
 
   private void validateChillModeExitRules(EventPublisher eventQueue) {
@@ -98,7 +103,7 @@ public class SCMChillModeManager implements
 
   /**
    * Exit chill mode. It does following actions:
-   * 1. Set chill mode status to fale.
+   * 1. Set chill mode status to false.
    * 2. Emits START_REPLICATION for ReplicationManager.
    * 3. Cleanup resources.
    * 4. Emit chill mode status.
@@ -130,6 +135,9 @@ public class SCMChillModeManager implements
   }
 
   public boolean getInChillMode() {
+    if (!isChillModeEnabled) {
+      return false;
+    }
     return inChillMode.get();
   }
 
@@ -162,7 +170,7 @@ public class SCMChillModeManager implements
 
     // Required cutoff % for containers with at least 1 reported replica.
     private double chillModeCutoff;
-    // Containers read from scm db.
+    // Containers read from scm db (excluding containers in ALLOCATED state).
     private Map<Long, ContainerInfo> containerMap;
     private double maxContainer;
 
@@ -174,11 +182,16 @@ public class SCMChillModeManager implements
       containerMap = new ConcurrentHashMap<>();
       if(containers != null) {
         containers.forEach(c -> {
-          if (c != null) {
+          // Containers in ALLOCATED state should not be included while
+          // calculating the total number of containers here. They are not
+          // reported by DNs and hence should not affect the chill mode exit
+          // rule.
+          if (c != null && c.getState() != null &&
+              !c.getState().equals(HddsProtos.LifeCycleState.ALLOCATED)) {
             containerMap.put(c.getContainerID(), c);
           }
         });
-        maxContainer = containers.size();
+        maxContainer = containerMap.size();
       }
     }
 
@@ -212,7 +225,7 @@ public class SCMChillModeManager implements
           }
         }
       });
-      if(inChillMode.get()) {
+      if(getInChillMode()) {
         LOG.info("SCM in chill mode. {} % containers have at least one"
                 + " reported replica.",
             (containerWithMinReplicas.get() / maxContainer) * 100);
@@ -262,7 +275,7 @@ public class SCMChillModeManager implements
         return;
       }
 
-      if(inChillMode.get()) {
+      if(getInChillMode()) {
         registeredDnSet.add(reportsProto.getDatanodeDetails().getUuid());
         registeredDns = registeredDnSet.size();
         LOG.info("SCM in chill mode. {} DataNodes registered, {} required.",

@@ -19,8 +19,8 @@ package org.apache.hadoop.hdds.scm.container;
 import org.apache.hadoop.hdds.protocol.proto
         .StorageContainerDatanodeProtocolProtos.PipelineReportsProto;
 import org.apache.hadoop.hdds.scm.TestUtils;
-import org.apache.hadoop.hdds.scm.container.common.helpers.Pipeline;
-import org.apache.hadoop.hdds.scm.container.common.helpers.PipelineID;
+import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
+import org.apache.hadoop.hdds.scm.pipeline.PipelineID;
 import org.apache.hadoop.hdds.scm.container.placement.metrics.SCMNodeMetric;
 import org.apache.hadoop.hdds.scm.container.placement.metrics.SCMNodeStat;
 import org.apache.hadoop.hdds.scm.exceptions.SCMException;
@@ -408,6 +408,12 @@ public class MockNodeManager implements NodeManager {
   }
 
   @Override
+  public Boolean isNodeRegistered(
+      DatanodeDetails datanodeDetails) {
+    return null;
+  }
+
+  @Override
   public Map<String, Integer> getNodeCount() {
     Map<String, Integer> nodeCountMap = new HashMap<String, Integer>();
     for (HddsProtos.NodeState state : HddsProtos.NodeState.values()) {
@@ -468,6 +474,11 @@ public class MockNodeManager implements NodeManager {
       aggregateStat.subtract(stat);
       stat.set(0, 0, 0);
     }
+  }
+
+  @Override
+  public List<SCMCommand> getCommandQueue(UUID dnID) {
+    return null;
   }
 
   /**

@@ -33,7 +33,7 @@ public final class OmKeyLocationInfo {
   private long createVersion;
 
   private OmKeyLocationInfo(BlockID blockID, boolean shouldCreateContainer,
-                            long length, long offset) {
+      long length, long offset) {
     this.blockID = blockID;
     this.shouldCreateContainer = shouldCreateContainer;
     this.length = length;
@@ -74,6 +74,10 @@ public final class OmKeyLocationInfo {
 
   public long getOffset() {
     return offset;
+  }
+
+  public long getBlockCommitSequenceId() {
+    return blockID.getBlockCommitSequenceId();
   }
 
   /**

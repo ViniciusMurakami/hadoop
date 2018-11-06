@@ -1615,8 +1615,8 @@ public class CapacityScheduler extends
             .add(node.getUnallocatedResource(), node.getTotalKillableResources()),
         minimumAllocation) <= 0) {
       if (LOG.isDebugEnabled()) {
-        LOG.debug("This node or this node partition doesn't have available or"
-            + "killable resource");
+        LOG.debug("This node or node partition doesn't have available or" +
+            " preemptible resource");
       }
       return null;
     }
@@ -2106,7 +2106,8 @@ public class CapacityScheduler extends
   private void updateQueuePreemptionMetrics(
       CSQueue queue, RMContainer rmc) {
     QueueMetrics qMetrics = queue.getMetrics();
-    long usedMillis = rmc.getFinishTime() - rmc.getCreationTime();
+    final long usedMillis = rmc.getFinishTime() - rmc.getCreationTime();
+    final long usedSeconds = usedMillis / DateUtils.MILLIS_PER_SECOND;
     Resource containerResource = rmc.getAllocatedResource();
     qMetrics.preemptContainer();
     long mbSeconds = (containerResource.getMemorySize() * usedMillis)
@@ -2115,6 +2116,8 @@ public class CapacityScheduler extends
         / DateUtils.MILLIS_PER_SECOND;
     qMetrics.updatePreemptedMemoryMBSeconds(mbSeconds);
     qMetrics.updatePreemptedVcoreSeconds(vcSeconds);
+    qMetrics.updatePreemptedSecondsForCustomResources(containerResource,
+        usedSeconds);
   }
 
   @Lock(Lock.NoLock.class)
@@ -2581,7 +2584,17 @@ public class CapacityScheduler extends
       LOG.error("queue " + queueName + " is not an leaf queue");
       return getMaximumResourceCapability();
     }
-    return ((LeafQueue)queue).getMaximumAllocation();
+
+    // queue.getMaxAllocation returns *configured* maximum allocation.
+    // getMaximumResourceCapability() returns maximum allocation considers
+    // per-node maximum resources. So return (component-wise) min of the two.
+
+    Resource queueMaxAllocation = ((LeafQueue)queue).getMaximumAllocation();
+    Resource clusterMaxAllocationConsiderNodeMax =
+        getMaximumResourceCapability();
+
+    return Resources.componentwiseMin(queueMaxAllocation,
+        clusterMaxAllocationConsiderNodeMax);
   }
 
   private String handleMoveToPlanQueue(String targetQueueName) {

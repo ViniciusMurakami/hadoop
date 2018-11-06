@@ -18,13 +18,15 @@ package org.apache.hadoop.hdds.scm.block;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.StorageUnit;
+import org.apache.hadoop.hdds.HddsUtils;
+import org.apache.hadoop.hdds.client.ContainerBlockID;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.ScmOps;
 import org.apache.hadoop.hdds.scm.ScmConfigKeys;
 import org.apache.hadoop.hdds.scm.ScmUtils;
 import org.apache.hadoop.hdds.scm.container.ContainerManager;
 import org.apache.hadoop.hdds.scm.container.common.helpers.AllocatedBlock;
 import org.apache.hadoop.hdds.scm.container.common.helpers.ContainerWithPipeline;
-import org.apache.hadoop.hdds.scm.container.common.helpers.ContainerInfo;
+import org.apache.hadoop.hdds.scm.container.ContainerInfo;
 import org.apache.hadoop.hdds.scm.exceptions.SCMException;
 import org.apache.hadoop.hdds.scm.node.NodeManager;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
@@ -36,7 +38,6 @@ import org.apache.hadoop.hdds.server.events.EventPublisher;
 import org.apache.hadoop.metrics2.util.MBeans;
 import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.util.StringUtils;
-import org.apache.hadoop.util.Time;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,7 +70,6 @@ public class BlockManagerImpl implements EventHandler<Boolean>,
   // Currently only user of the block service is Ozone, CBlock manages blocks
   // by itself and does not rely on the Block service offered by SCM.
 
-  private final NodeManager nodeManager;
   private final ContainerManager containerManager;
 
   private final long containerSize;
@@ -95,7 +95,6 @@ public class BlockManagerImpl implements EventHandler<Boolean>,
       final NodeManager nodeManager, final ContainerManager containerManager,
       EventPublisher eventPublisher)
       throws IOException {
-    this.nodeManager = nodeManager;
     this.containerManager = containerManager;
 
     this.containerSize = (long)conf.getStorageSize(
@@ -125,7 +124,7 @@ public class BlockManagerImpl implements EventHandler<Boolean>,
     blockDeletingService =
         new SCMBlockDeletingService(deletedBlockLog, containerManager,
             nodeManager, eventPublisher, svcInterval, serviceTimeout, conf);
-    chillModePrecheck = new ChillModePrecheck();
+    chillModePrecheck = new ChillModePrecheck(conf);
   }
 
   /**
@@ -226,8 +225,7 @@ public class BlockManagerImpl implements EventHandler<Boolean>,
     // USER of the containers. So there might be cases where a different
     // USER has few containers in ALLOCATED state, which will result in
     // false positive.
-    if (!containerManager.getStateManager().getContainerStateMap()
-        .getContainerIDsByState(HddsProtos.LifeCycleState.ALLOCATED)
+    if (!containerManager.getContainers(HddsProtos.LifeCycleState.ALLOCATED)
         .isEmpty()) {
       // Since the above check can result in false positive, we have to do
       // the actual check and find out if there are containers in ALLOCATED
@@ -242,7 +240,7 @@ public class BlockManagerImpl implements EventHandler<Boolean>,
                 HddsProtos.LifeCycleState.ALLOCATED);
         if (containerWithPipeline != null) {
           containerManager.updateContainerState(
-              containerWithPipeline.getContainerInfo().getContainerID(),
+              containerWithPipeline.getContainerInfo().containerID(),
               HddsProtos.LifeCycleEvent.CREATE);
           return newBlock(containerWithPipeline,
               HddsProtos.LifeCycleState.ALLOCATED);
@@ -268,8 +266,7 @@ public class BlockManagerImpl implements EventHandler<Boolean>,
     // state, we have to check again as we only hold a read lock.
     // Some other thread might have pre-allocated container in meantime.
     synchronized (this) {
-      if (!containerManager.getStateManager().getContainerStateMap()
-          .getContainerIDsByState(HddsProtos.LifeCycleState.ALLOCATED)
+      if (!containerManager.getContainers(HddsProtos.LifeCycleState.ALLOCATED)
           .isEmpty()) {
         containerWithPipeline = containerManager
             .getMatchingContainerWithPipeline(size, owner, type, factor,
@@ -285,7 +282,7 @@ public class BlockManagerImpl implements EventHandler<Boolean>,
 
       if (containerWithPipeline != null) {
         containerManager.updateContainerState(
-            containerWithPipeline.getContainerInfo().getContainerID(),
+            containerWithPipeline.getContainerInfo().containerID(),
             HddsProtos.LifeCycleEvent.CREATE);
         return newBlock(containerWithPipeline,
             HddsProtos.LifeCycleState.ALLOCATED);
@@ -309,7 +306,7 @@ public class BlockManagerImpl implements EventHandler<Boolean>,
   private AllocatedBlock newBlock(ContainerWithPipeline containerWithPipeline,
       HddsProtos.LifeCycleState state) throws IOException {
     ContainerInfo containerInfo = containerWithPipeline.getContainerInfo();
-    if (containerWithPipeline.getPipeline().getDatanodes().size() == 0) {
+    if (containerWithPipeline.getPipeline().getNodes().size() == 0) {
       LOG.error("Pipeline Machine count is zero.");
       return null;
     }
@@ -322,7 +319,7 @@ public class BlockManagerImpl implements EventHandler<Boolean>,
 
     AllocatedBlock.Builder abb =
         new AllocatedBlock.Builder()
-            .setBlockID(new BlockID(containerID, localID))
+            .setContainerBlockID(new ContainerBlockID(containerID, localID))
             .setPipeline(containerWithPipeline.getPipeline())
             .setShouldCreateContainer(createContainer);
     LOG.trace("New block allocated : {} Container ID: {}", localID,
@@ -469,7 +466,7 @@ public class BlockManagerImpl implements EventHandler<Boolean>,
      * @return unique long value
      */
     public static synchronized long next() {
-      long utcTime = Time.getUtcTime();
+      long utcTime = HddsUtils.getUtcTime();
       if ((utcTime & 0xFFFF000000000000L) == 0) {
         return utcTime << Short.SIZE | (offset++ & 0x0000FFFF);
       }

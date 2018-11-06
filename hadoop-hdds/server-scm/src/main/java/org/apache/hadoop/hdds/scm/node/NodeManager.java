@@ -19,8 +19,8 @@ package org.apache.hadoop.hdds.scm.node;
 
 import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.NodeReportProto;
 import org.apache.hadoop.hdds.scm.container.ContainerID;
-import org.apache.hadoop.hdds.scm.container.common.helpers.Pipeline;
-import org.apache.hadoop.hdds.scm.container.common.helpers.PipelineID;
+import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
+import org.apache.hadoop.hdds.scm.pipeline.PipelineID;
 import org.apache.hadoop.hdds.scm.container.placement.metrics.SCMNodeMetric;
 import org.apache.hadoop.hdds.scm.container.placement.metrics.SCMNodeStat;
 import org.apache.hadoop.hdds.scm.exceptions.SCMException;
@@ -196,4 +196,11 @@ public interface NodeManager extends StorageContainerNodeProtocol,
    * @param dnUuid datanode uuid.
    */
   void processDeadNode(UUID dnUuid);
+
+  /**
+   * Get list of SCMCommands in the Command Queue for a particular Datanode.
+   * @param dnID - Datanode uuid.
+   * @return list of commands
+   */
+  List<SCMCommand> getCommandQueue(UUID dnID);
 }
